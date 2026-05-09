@@ -1,0 +1,227 @@
+{
+  "name": "redmine-connector",
+  "displayName": "Redmine Connector",
+  "description": "Connect your company's Redmine to VS Code, Cursor, Windsurf — manage issues and push to AI chat",
+  "publisher": "company-internal",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Redmine Connector",
+      "properties": {
+        "redmine.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Redmine server URL (e.g. https://redmine.company.com)"
+        },
+        "redmine.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your Redmine API key (find it in My Account → API access key)"
+        },
+        "redmine.defaultProject": {
+          "type": "string",
+          "default": "",
+          "description": "Default project identifier to show issues for"
+        },
+        "redmine.showOnlyAssignedToMe": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only show issues assigned to me by default"
+        },
+        "redmine.textFormat": {
+          "type": "string",
+          "default": "textile",
+          "enum": ["textile", "markdown", "plain"],
+          "enumDescriptions": [
+            "Redmine Textile (default)",
+            "Markdown",
+            "Plain text"
+          ],
+          "description": "Text format used in your Redmine instance for descriptions and comments"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "redmine",
+          "title": "Redmine",
+          "icon": "resources/redmine.svg"
+        }
+      ]
+    },
+    "views": {
+      "redmine": [
+        {
+          "id": "redmine.issueList",
+          "name": "Issues",
+          "icon": "resources/redmine.svg"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "redmine",
+        "name": "redmine",
+        "description": "Query and manage Redmine issues directly in AI chat",
+        "isSticky": false
+      }
+    ],
+    "commands": [
+      {
+        "command": "redmine.refresh",
+        "title": "Refresh Issues",
+        "icon": "$(refresh)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.openIssue",
+        "title": "Open Issue Detail",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.pushToChat",
+        "title": "Push Issue to AI Chat",
+        "icon": "$(comment-discussion)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.copyIssueMarkdown",
+        "title": "Copy Issue as Markdown",
+        "icon": "$(copy)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.updateStatus",
+        "title": "Update Status",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.assignIssue",
+        "title": "Assign Issue",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.addComment",
+        "title": "Add Comment",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.createIssue",
+        "title": "Create New Issue",
+        "icon": "$(add)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.filter",
+        "title": "Filter Issues",
+        "icon": "$(filter)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.clearFilters",
+        "title": "Clear Filters",
+        "icon": "$(filter-filled)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.filterByProject",
+        "title": "Filter by Project",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.filterByStatus",
+        "title": "Filter by Status",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.configure",
+        "title": "Configure Redmine Connection",
+        "icon": "$(settings-gear)",
+        "category": "Redmine"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "redmine.refresh",
+          "when": "view == redmine.issueList",
+          "group": "navigation"
+        },
+        {
+          "command": "redmine.createIssue",
+          "when": "view == redmine.issueList",
+          "group": "navigation"
+        },
+        {
+          "command": "redmine.filter",
+          "when": "view == redmine.issueList",
+          "group": "navigation"
+        },
+        {
+          "command": "redmine.configure",
+          "when": "view == redmine.issueList",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "redmine.openIssue",
+          "when": "view == redmine.issueList && viewItem == issue",
+          "group": "inline@1"
+        },
+        {
+          "command": "redmine.pushToChat",
+          "when": "view == redmine.issueList && viewItem == issue",
+          "group": "inline@2"
+        },
+        {
+          "command": "redmine.updateStatus",
+          "when": "view == redmine.issueList && viewItem == issue",
+          "group": "redmine@1"
+        },
+        {
+          "command": "redmine.assignIssue",
+          "when": "view == redmine.issueList && viewItem == issue",
+          "group": "redmine@2"
+        },
+        {
+          "command": "redmine.addComment",
+          "when": "view == redmine.issueList && viewItem == issue",
+          "group": "redmine@3"
+        },
+        {
+          "command": "redmine.copyIssueMarkdown",
+          "when": "view == redmine.issueList && viewItem == issue",
+          "group": "redmine@4"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p ./tsconfig.json",
+    "watch": "tsc -watch -p ./tsconfig.json",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "marked": "^18.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.3.0"
+  }
+}
