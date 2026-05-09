@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk npm *)",
+      "Bash(rtk npx *)",
+      "Bash(cursor --install-extension redmine-connector-1.0.0.vsix)",
+      "Bash(rtk ls *)",
+      "Bash(rtk read *)",
+      "Bash(rtk grep *)"
+    ]
+  }
+}

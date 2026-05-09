@@ -132,7 +132,7 @@ export async function updateIssue(
 ): Promise<void> {
   const body: Record<string, unknown> = {};
   if (updates.statusId !== undefined) body["status_id"] = updates.statusId;
-  if (updates.assignedToId !== undefined) body["assigned_to_id"] = updates.assignedToId;
+  if (updates.assignedToId !== undefined) body["assigned_to_id"] = updates.assignedToId === 0 ? "" : updates.assignedToId;
   if (updates.notes !== undefined) body["notes"] = updates.notes;
   if (updates.subject !== undefined) body["subject"] = updates.subject;
   if (updates.description !== undefined) body["description"] = updates.description;

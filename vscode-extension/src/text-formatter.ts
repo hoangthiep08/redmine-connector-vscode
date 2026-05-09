@@ -19,8 +19,9 @@ export function renderText(text: string, format?: TextFormat): string {
 // ── Markdown ────────────────────────────────────────────────────────────────
 
 function renderMarkdown(text: string): string {
-  marked.use({ breaks: true, gfm: true });
-  return marked.parse(text) as string;
+  marked.use({ breaks: true, gfm: true, async: false });
+  const result = marked.parse(text);
+  return typeof result === "string" ? result : escHtml(text);
 }
 
 // ── Textile ─────────────────────────────────────────────────────────────────

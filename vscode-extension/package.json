@@ -3,7 +3,7 @@
   "displayName": "Redmine Connector",
   "description": "Connect your company's Redmine to VS Code, Cursor, Windsurf — manage issues and push to AI chat",
   "publisher": "company-internal",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -14,6 +14,7 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "icon": "resources/redmine.png",
   "contributes": {
     "configuration": {
       "title": "Redmine Connector",
@@ -41,7 +42,11 @@
         "redmine.textFormat": {
           "type": "string",
           "default": "textile",
-          "enum": ["textile", "markdown", "plain"],
+          "enum": [
+            "textile",
+            "markdown",
+            "plain"
+          ],
           "enumDescriptions": [
             "Redmine Textile (default)",
             "Markdown",
@@ -56,7 +61,7 @@
         {
           "id": "redmine",
           "title": "Redmine",
-          "icon": "resources/redmine.svg"
+          "icon": "resources/redmine-mono.svg"
         }
       ]
     },
@@ -222,6 +227,7 @@
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^2.22.0",
+    "sharp": "^0.34.5",
     "typescript": "^5.3.0"
   }
 }

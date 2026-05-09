@@ -1,20 +1,22 @@
 import * as vscode from "vscode";
 import {
   Issue,
-  Attachment,
   Journal,
-  getBaseUrl,
+  Attachment,
   getIssue,
+  listStatuses,
+  listProjectMembers,
   updateIssue,
   updateJournal,
   deleteJournal,
   fetchAttachmentAsDataUrl,
   isImageAttachment,
-  formatIssueAsMarkdown,
+  getBaseUrl,
+  IssueStatus,
+  Member,
 } from "./redmine-client";
-import { copyImageToClipboard } from "./image-clipboard";
+import { pushIssueToAI } from "./push-to-ai";
 import { renderText, FORMATTER_CSS } from "./text-formatter";
-import { openChatWithText } from "./chat-participant";
 
 export class IssueWebview {
   private panel: vscode.WebviewPanel | null = null;
@@ -22,480 +24,895 @@ export class IssueWebview {
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
-  async show(issue: Issue): Promise<void> {
+  async show(issue: Issue) {
     this.currentIssue = issue;
 
     if (this.panel) {
       this.panel.reveal();
-    } else {
-      this.panel = vscode.window.createWebviewPanel(
-        "redmineIssue",
-        `#${issue.id}`,
-        vscode.ViewColumn.One,
-        { enableScripts: true, retainContextWhenHidden: true }
-      );
-      this.panel.onDidDispose(() => {
-        this.panel = null;
-        this.currentIssue = null;
-      });
-      this.panel.webview.onDidReceiveMessage(async (msg) => {
-        await this.handleMessage(msg);
-      });
+      this.panel.title = `#${issue.id} ${issue.subject}`;
+      this.panel.webview.html = this.buildHtml(issue);
+      return;
     }
 
-    this.panel.title = `#${issue.id} ${issue.subject.slice(0, 40)}`;
-
-    // Show loading skeleton first, then load images
-    this.panel.webview.html = await this.buildHtml(issue);
-  }
-
-  private async handleMessage(msg: { command: string; [key: string]: unknown }) {
-    if (!this.currentIssue) return;
-
-    if (msg.command === "addComment") {
-      const notes = msg.notes as string;
-      if (notes?.trim()) {
-        await updateIssue(this.currentIssue.id, { notes });
-        vscode.window.showInformationMessage("Comment added.");
-        vscode.commands.executeCommand("redmine.refresh");
-      }
-    }
-    if (msg.command === "openInBrowser") {
-      vscode.env.openExternal(vscode.Uri.parse(`${getBaseUrl()}/issues/${this.currentIssue.id}`));
-    }
-    if (msg.command === "openInChat") {
-      const markdown = formatIssueAsMarkdown(this.currentIssue, getBaseUrl());
-      const prompt = `Here is a Redmine issue I need help with:\n\n${markdown}`;
-      const opened = await openChatWithText(prompt);
-      if (opened) {
-        vscode.window.showInformationMessage(`Issue #${this.currentIssue.id} sent to AI chat.`);
-      } else {
-        await vscode.env.clipboard.writeText(markdown);
-        vscode.window.showInformationMessage("Chat panel not detected — copied to clipboard instead.");
-      }
-    }
-    if (msg.command === "copyMarkdown") {
-      const markdown = formatIssueAsMarkdown(this.currentIssue, getBaseUrl());
-      await vscode.env.clipboard.writeText(markdown);
-      vscode.window.showInformationMessage(`Issue #${this.currentIssue.id} copied. Paste into any AI chat.`);
-    }
-    if (msg.command === "copyClaudePrompt") {
-      const markdown = formatIssueAsMarkdown(this.currentIssue, getBaseUrl());
-      const prompt = `Here is a Redmine issue I need help with:\n\n${markdown}`;
-      await vscode.env.clipboard.writeText(prompt);
-      vscode.window.showInformationMessage("Copied. Paste in Claude Code chat or terminal.");
-    }
-    if (msg.command === "openAttachment") {
-      vscode.env.openExternal(vscode.Uri.parse(msg.url as string));
-    }
-    if (msg.command === "copyImageToClipboard") {
-      const att = (this.currentIssue.attachments ?? []).find((a) => a.id === msg.id);
-      if (att) await copyImageToClipboard(att);
-    }
-    if (msg.command === "editComment") {
-      const journalId = msg.journalId as number;
-      const currentText = msg.currentText as string;
-      const newText = await vscode.window.showInputBox({
-        title: "Edit Comment",
-        value: currentText,
-        ignoreFocusOut: true,
-      });
-      if (newText === undefined || newText === currentText) return;
-      try {
-        await updateJournal(journalId, newText);
-        vscode.window.showInformationMessage("Comment updated.");
-        const updated = await this.refreshIssue();
-        if (updated) this.panel!.webview.html = await this.buildHtml(updated);
-      } catch (err) {
-        vscode.window.showErrorMessage(`Failed to edit: ${err}`);
-      }
-    }
-    if (msg.command === "deleteComment") {
-      const journalId = msg.journalId as number;
-      const confirm = await vscode.window.showWarningMessage(
-        "Delete this comment permanently?",
-        { modal: true },
-        "Delete"
-      );
-      if (confirm !== "Delete") return;
-      try {
-        await deleteJournal(journalId);
-        vscode.window.showInformationMessage("Comment deleted.");
-        const updated = await this.refreshIssue();
-        if (updated) this.panel!.webview.html = await this.buildHtml(updated);
-      } catch (err) {
-        vscode.window.showErrorMessage(`Failed to delete: ${err}`);
-      }
-    }
-    if (msg.command === "replyComment") {
-      // Quote original comment then scroll to textarea
-      this.panel?.webview.postMessage({
-        command: "fillReply",
-        quote: msg.quote as string,
-        author: msg.author as string,
-      });
-    }
-  }
-
-  private async refreshIssue(): Promise<Issue | null> {
-    if (!this.currentIssue) return null;
-    try {
-      const fresh = await getIssue(this.currentIssue.id);
-      this.currentIssue = fresh;
-      vscode.commands.executeCommand("redmine.refresh");
-      return fresh;
-    } catch {
-      return null;
-    }
-  }
-
-  private async buildHtml(issue: Issue): Promise<string> {
-    const baseUrl = getBaseUrl();
-    const issueUrl = baseUrl ? `${baseUrl}/issues/${issue.id}` : "";
-    const attachments = issue.attachments ?? [];
-    const comments = (issue.journals ?? []).filter((j) => j.notes).reverse();
-    const history = (issue.journals ?? []).filter((j) => j.details.length > 0);
-
-    // Fetch images as base64 in parallel (max 10 images)
-    const imageAttachments = attachments.filter(isImageAttachment).slice(0, 10);
-    const imageDataUrls = new Map<number, string>();
-    await Promise.allSettled(
-      imageAttachments.map(async (att) => {
-        try {
-          const dataUrl = await fetchAttachmentAsDataUrl(att.content_url);
-          imageDataUrls.set(att.id, dataUrl);
-        } catch {
-          // silently skip failed images
-        }
-      })
+    this.panel = vscode.window.createWebviewPanel(
+      "redmineIssue",
+      `#${issue.id} ${issue.subject}`,
+      vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true }
     );
 
-    const attachmentsHtml = this.buildAttachmentsHtml(attachments, imageDataUrls, baseUrl);
-    const commentsHtml = this.buildCommentsHtml(comments, attachments, imageDataUrls, baseUrl);
-    const historyHtml = this.buildHistoryHtml(history);
+    this.panel.onDidDispose(() => {
+      this.panel = null;
+      this.currentIssue = null;
+    });
+
+    this.panel.webview.html = this.buildHtml(issue);
+
+    this.panel.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
+      await this.handleMessage(msg);
+    });
+  }
+
+  private async refresh() {
+    if (!this.currentIssue || !this.panel) return;
+    try {
+      const issue = await getIssue(this.currentIssue.id);
+      this.currentIssue = issue;
+      this.panel.title = `#${issue.id} ${issue.subject}`;
+      this.panel.webview.html = this.buildHtml(issue);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Failed to refresh issue: ${err}`);
+    }
+  }
+
+  private async handleMessage(msg: WebviewMessage) {
+    switch (msg.command) {
+      case "pushToAI":
+        if (this.currentIssue) await pushIssueToAI(this.currentIssue);
+        break;
+
+      case "openInBrowser": {
+        const url = `${getBaseUrl()}/issues/${this.currentIssue!.id}`;
+        await vscode.env.openExternal(vscode.Uri.parse(url));
+        break;
+      }
+
+      case "changeStatus": {
+        let statuses: IssueStatus[];
+        try {
+          statuses = await listStatuses();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to load statuses: ${err}`);
+          return;
+        }
+        const statusPick = await vscode.window.showQuickPick(
+          statuses.map((s) => ({
+            label: s.name,
+            description: s.is_closed ? "(closed)" : undefined,
+            id: s.id,
+          })),
+          {
+            title: `Update Status — #${this.currentIssue!.id}`,
+            placeHolder: `Current: ${this.currentIssue!.status.name}`,
+          }
+        );
+        if (!statusPick) return;
+        try {
+          await updateIssue(this.currentIssue!.id, { statusId: statusPick.id });
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to update status: ${err}`);
+        }
+        break;
+      }
+
+      case "changeAssignee": {
+        let members: Member[];
+        try {
+          members = await listProjectMembers(String(this.currentIssue!.project.id));
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to load members: ${err}`);
+          return;
+        }
+        const assignPicks: { label: string; description?: string; id: number }[] = [
+          { label: "Unassigned", description: "Remove assignee", id: 0 },
+          ...members.map((m) => ({
+            label: m.name,
+            description: m.roles.join(", "),
+            id: m.id,
+          })),
+        ];
+        const assignPick = await vscode.window.showQuickPick(assignPicks, {
+          title: `Assign Issue #${this.currentIssue!.id}`,
+          placeHolder: `Current: ${this.currentIssue!.assigned_to?.name ?? "Unassigned"}`,
+        });
+        if (!assignPick) return;
+        try {
+          await updateIssue(this.currentIssue!.id, { assignedToId: assignPick.id });
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to assign issue: ${err}`);
+        }
+        break;
+      }
+
+      case "addComment": {
+        const notes = await vscode.window.showInputBox({
+          title: `Add Comment to #${this.currentIssue!.id}`,
+          prompt: "Enter your comment",
+          ignoreFocusOut: true,
+        });
+        if (!notes?.trim()) return;
+        try {
+          await updateIssue(this.currentIssue!.id, { notes: notes.trim() });
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to add comment: ${err}`);
+        }
+        break;
+      }
+
+      case "replyComment": {
+        const quote = typeof msg.quote === "string" ? msg.quote : "";
+        const quotedBlock = quote
+          ? quote
+              .split("\n")
+              .map((l: string) => `> ${l}`)
+              .join("\n") + "\n\n"
+          : "";
+        const replyText = await vscode.window.showInputBox({
+          title: "Reply to Comment",
+          value: quotedBlock,
+          prompt: "Enter your reply",
+          ignoreFocusOut: true,
+        });
+        if (!replyText?.trim()) return;
+        try {
+          await updateIssue(this.currentIssue!.id, { notes: replyText.trim() });
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to post reply: ${err}`);
+        }
+        break;
+      }
+
+      case "editComment": {
+        const journalId = msg.journalId as number;
+        const currentNotes = typeof msg.currentNotes === "string" ? msg.currentNotes : "";
+        const edited = await vscode.window.showInputBox({
+          title: "Edit Comment",
+          value: currentNotes,
+          prompt: "Edit your comment",
+          ignoreFocusOut: true,
+        });
+        if (edited === undefined) return;
+        try {
+          await updateJournal(journalId, edited);
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to edit comment: ${err}`);
+        }
+        break;
+      }
+
+      case "deleteComment": {
+        const journalId = msg.journalId as number;
+        const confirmed = await vscode.window.showWarningMessage(
+          "Delete this comment permanently?",
+          { modal: true },
+          "Delete"
+        );
+        if (confirmed !== "Delete") return;
+        try {
+          await deleteJournal(journalId);
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to delete comment: ${err}`);
+        }
+        break;
+      }
+
+      case "loadImage": {
+        const url = typeof msg.url === "string" ? msg.url : "";
+        const attachmentId = msg.attachmentId as number;
+        try {
+          const dataUrl = await fetchAttachmentAsDataUrl(url);
+          this.panel?.webview.postMessage({ command: "imageLoaded", attachmentId, dataUrl });
+        } catch {
+          this.panel?.webview.postMessage({ command: "imageError", attachmentId });
+        }
+        break;
+      }
+    }
+  }
+
+  private buildHtml(issue: Issue): string {
+    const version: string = this.context.extension?.packageJSON?.version ?? "1.0.x";
+    const comments = (issue.journals ?? [])
+      .filter((j) => j.notes && j.notes.trim())
+      .slice()
+      .reverse();
+
+    const allJournals = (issue.journals ?? []).slice().reverse();
+
+    const imageAttachments = (issue.attachments ?? []).filter(isImageAttachment);
+    const fileAttachments = (issue.attachments ?? []).filter((a) => !isImageAttachment(a));
+
+    const progressColor =
+      issue.done_ratio >= 100
+        ? "var(--vscode-testing-iconPassed)"
+        : issue.done_ratio >= 50
+        ? "var(--vscode-charts-blue)"
+        : "var(--vscode-charts-yellow)";
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>#${issue.id}</title>
+<title>#${issue.id} ${esc(issue.subject)}</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; }
-  body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 16px 20px; max-width: 960px; margin: 0 auto; }
-  h1 { font-size: 1.3em; margin: 4px 0 0; }
-  .issue-meta-line { color: var(--vscode-descriptionForeground); font-size: 0.85em; margin-bottom: 16px; }
-  .issue-meta-line a { color: var(--vscode-textLink-foreground); text-decoration: none; }
-  .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0; }
-  .meta-item { background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; padding: 8px 12px; }
-  .meta-label { font-size: 0.72em; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px; }
-  .meta-value { font-weight: 600; }
-  .section { margin: 20px 0; }
-  .section h2 { font-size: 0.95em; border-bottom: 1px solid var(--vscode-widget-border); padding-bottom: 5px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--vscode-descriptionForeground); }
-/* Attachments */
-  .attachments-grid { display: flex; flex-wrap: wrap; gap: 10px; }
-  .attachment-card { background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 6px; overflow: hidden; cursor: pointer; border: 1px solid transparent; transition: border-color 0.15s; max-width: 220px; }
-  .attachment-card:hover { border-color: var(--vscode-focusBorder); }
-  .attachment-img { width: 220px; height: 140px; object-fit: cover; display: block; background: var(--vscode-textCodeBlock-background); }
-  .attachment-img-placeholder { width: 220px; height: 140px; display: flex; align-items: center; justify-content: center; font-size: 2em; background: var(--vscode-textCodeBlock-background); }
-  .attachment-name { padding: 6px 8px 2px; font-size: 0.78em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .attachment-footer { display: flex; align-items: center; justify-content: space-between; padding: 0 6px 6px; }
-  .attachment-size { font-size: 0.72em; color: var(--vscode-descriptionForeground); }
-  .copy-img-btn { font-size: 0.72em; padding: 2px 7px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; border-radius: 3px; cursor: pointer; }
-  .copy-img-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
-  /* Image lightbox */
-  .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 1000; align-items: center; justify-content: center; }
-  .lightbox.open { display: flex; }
-  .lightbox img { max-width: 92vw; max-height: 90vh; border-radius: 4px; object-fit: contain; }
-  .lightbox-close { position: fixed; top: 16px; right: 20px; font-size: 1.8em; color: white; cursor: pointer; background: none; border: none; line-height: 1; }
-  /* Inline images in descriptions/comments */
-  .inline-img { max-width: 100%; border-radius: 4px; margin: 6px 0; cursor: pointer; display: block; }
-  /* Comments */
-  .comment { border-left: 3px solid var(--vscode-textLink-foreground); padding: 8px 12px; margin: 10px 0; background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 0 4px 4px 0; }
-  .comment-header { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
-  .date { color: var(--vscode-descriptionForeground); font-size: 0.82em; }
-  .comment-actions { margin-left: auto; display: flex; gap: 4px; opacity: 0; transition: opacity 0.15s; }
-  .comment:hover .comment-actions { opacity: 1; }
-  .comment-btn { font-size: 0.75em; padding: 2px 8px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; border-radius: 3px; cursor: pointer; font-family: inherit; }
-  .comment-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
-  .comment-btn-danger:hover { background: var(--vscode-inputValidation-errorBackground); color: var(--vscode-inputValidation-errorForeground); }
-  .comment-body { white-space: pre-wrap; line-height: 1.5; }
-  .reply-quote { background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textBlockQuote-border); padding: 6px 10px; margin-bottom: 6px; font-size: 0.88em; color: var(--vscode-descriptionForeground); border-radius: 0 3px 3px 0; white-space: pre-wrap; }
-  .history-item { margin: 8px 0; font-size: 0.88em; }
-  .history-item ul { margin: 4px 0; padding-left: 18px; }
-  /* Actions */
-  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 18px; align-items: flex-start; }
-  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-size: 0.88em; font-family: inherit; }
-  button:hover { background: var(--vscode-button-hoverBackground); }
-  .btn-secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-  .btn-secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
-  .btn-ai { background: #2d7d46; color: #fff; }
-  .btn-ai:hover { background: #236b3a; }
-  textarea { width: 100%; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); border-radius: 4px; padding: 8px; font-family: inherit; font-size: inherit; resize: vertical; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
-  .progress-bar { background: var(--vscode-progressBar-background); height: 5px; border-radius: 3px; width: ${issue.done_ratio}%; margin-top: 4px; }
-  .progress-track { background: var(--vscode-scrollbarSlider-background); height: 5px; border-radius: 3px; }
-  .empty { color: var(--vscode-descriptionForeground); font-style: italic; }
-  /* Rich text */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    padding: 0;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  /* ── Header ── */
+  .issue-header {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid var(--vscode-widget-border, #333);
+    position: sticky;
+    top: 0;
+    background: var(--vscode-editor-background);
+    z-index: 10;
+  }
+  .issue-meta-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .issue-id {
+    font-size: 0.85em;
+    font-weight: 600;
+    color: var(--vscode-descriptionForeground);
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    padding: 2px 8px;
+    border-radius: 10px;
+  }
+  .issue-tracker {
+    font-size: 0.8em;
+    color: var(--vscode-descriptionForeground);
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    padding: 2px 8px;
+    border-radius: 10px;
+  }
+  .issue-status {
+    font-size: 0.8em;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--vscode-charts-blue) 20%, transparent);
+    color: var(--vscode-charts-blue);
+  }
+  .issue-priority {
+    font-size: 0.78em;
+    color: var(--vscode-descriptionForeground);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--vscode-widget-border, #555);
+  }
+  .issue-title {
+    font-size: 1.25em;
+    font-weight: 700;
+    line-height: 1.4;
+    color: var(--vscode-foreground);
+    margin-bottom: 12px;
+  }
+
+  /* ── Action bar ── */
+  .action-bar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 14px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85em;
+    font-weight: 500;
+    transition: opacity 0.15s;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  .btn-danger {
+    background: color-mix(in srgb, var(--vscode-errorForeground) 15%, transparent);
+    color: var(--vscode-errorForeground);
+    border: 1px solid color-mix(in srgb, var(--vscode-errorForeground) 40%, transparent);
+  }
+  .btn-sm {
+    padding: 3px 10px;
+    font-size: 0.8em;
+  }
+
+  /* ── Body layout ── */
+  .body-content {
+    padding: 20px 24px;
+  }
+
+  /* ── Meta grid ── */
+  .meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 1px;
+    background: var(--vscode-widget-border, #333);
+    border: 1px solid var(--vscode-widget-border, #333);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+  .meta-item {
+    background: var(--vscode-editor-background);
+    padding: 10px 14px;
+  }
+  .meta-label {
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--vscode-descriptionForeground);
+    margin-bottom: 3px;
+    font-weight: 600;
+  }
+  .meta-value {
+    font-size: 0.9em;
+    font-weight: 500;
+  }
+  .progress-bar-wrap {
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border-radius: 4px;
+    height: 6px;
+    margin-top: 5px;
+    overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%;
+    border-radius: 4px;
+    background: ${progressColor};
+    width: ${issue.done_ratio}%;
+    transition: width 0.3s;
+  }
+
+  /* ── Sections ── */
+  .section {
+    margin-bottom: 24px;
+  }
+  .section-title {
+    font-size: 0.8em;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--vscode-descriptionForeground);
+    font-weight: 700;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .section-title .count {
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 0.9em;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 600;
+  }
+  .section-divider {
+    border: none;
+    border-top: 1px solid var(--vscode-widget-border, #333);
+    margin: 20px 0;
+  }
+
+  /* ── Description ── */
+  .description-box {
+    background: var(--vscode-textCodeBlock-background);
+    border: 1px solid var(--vscode-widget-border, #333);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .empty-desc {
+    color: var(--vscode-descriptionForeground);
+    font-style: italic;
+    font-size: 0.9em;
+  }
+
+  /* ── Attachments ── */
+  .attachments-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .image-card {
+    border: 1px solid var(--vscode-widget-border, #333);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    max-width: 200px;
+    cursor: pointer;
+  }
+  .image-card img {
+    width: 200px;
+    height: 140px;
+    object-fit: cover;
+    display: block;
+  }
+  .image-card .img-name {
+    font-size: 0.78em;
+    padding: 5px 8px;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .image-placeholder {
+    width: 200px;
+    height: 140px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.8em;
+  }
+  .file-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border-radius: 5px;
+    font-size: 0.85em;
+  }
+  .file-item a {
+    color: var(--vscode-textLink-foreground);
+    text-decoration: none;
+    flex: 1;
+  }
+  .file-item a:hover { text-decoration: underline; }
+  .file-size {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+    white-space: nowrap;
+  }
+
+  /* ── Image modal ── */
+  .img-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.85);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    cursor: zoom-out;
+  }
+  .img-modal.open { display: flex; }
+  .img-modal img {
+    max-width: 95vw;
+    max-height: 95vh;
+    object-fit: contain;
+    border-radius: 4px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+  }
+
+  /* ── Comments ── */
+  .comments-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .comment-card {
+    border: 1px solid var(--vscode-widget-border, #333);
+    border-radius: 8px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+  .comment-card:hover { border-color: var(--vscode-focusBorder, #007acc); }
+  .comment-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    flex-wrap: wrap;
+  }
+  .comment-avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75em;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .comment-author { font-weight: 600; font-size: 0.9em; }
+  .comment-date {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.8em;
+    margin-left: 2px;
+  }
+  .comment-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .comment-card:hover .comment-actions { opacity: 1; }
+  .comment-body {
+    padding: 12px 16px;
+  }
+  .journal-changes {
+    padding: 8px 16px 10px;
+    font-size: 0.82em;
+    color: var(--vscode-descriptionForeground);
+    border-top: 1px solid var(--vscode-widget-border, #333);
+  }
+  .journal-change {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 2px 0;
+  }
+  .change-field {
+    font-weight: 600;
+    color: var(--vscode-foreground);
+    min-width: 80px;
+  }
+  .change-arrow { opacity: 0.5; }
+  .change-old { text-decoration: line-through; opacity: 0.6; }
+  .change-new { font-weight: 500; }
+
+  /* ── Rich text ── */
   ${FORMATTER_CSS}
 </style>
 </head>
 <body>
 
-<div class="issue-meta-line">${esc(issue.project.name)} · ${esc(issue.tracker.name)} · <a href="${issueUrl}" onclick="openBrowser(event,'${issueUrl}')">${issueUrl}</a></div>
-<h1>#${issue.id} ${esc(issue.subject)}</h1>
-
-<div class="actions">
-  <button class="btn-ai" onclick="openInChat()">⚡ Push issue to AI</button>
-  <button class="btn-secondary" onclick="openInBrowser()">Open in Browser</button>
+<!-- Image Modal -->
+<div class="img-modal" id="imgModal" onclick="closeModal()">
+  <img id="modalImg" src="" alt="">
 </div>
 
-<div class="meta-grid">
-  <div class="meta-item">
-    <div class="meta-label">Status</div>
-    <div class="meta-value"><span class="badge">${esc(issue.status.name)}</span></div>
+<!-- Sticky Header -->
+<div class="issue-header">
+  <div class="issue-meta-top">
+    <span class="issue-id">#${issue.id}</span>
+    <span class="issue-tracker">${esc(issue.tracker.name)}</span>
+    <span class="issue-status">${esc(issue.status.name)}</span>
+    <span class="issue-priority">⚡ ${esc(issue.priority.name)}</span>
   </div>
-  <div class="meta-item">
-    <div class="meta-label">Priority</div>
-    <div class="meta-value">${esc(issue.priority.name)}</div>
-  </div>
-  <div class="meta-item">
-    <div class="meta-label">Assignee</div>
-    <div class="meta-value">${esc(issue.assigned_to?.name ?? "Unassigned")}</div>
-  </div>
-  <div class="meta-item">
-    <div class="meta-label">Author</div>
-    <div class="meta-value">${esc(issue.author.name)}</div>
-  </div>
-  <div class="meta-item">
-    <div class="meta-label">Progress</div>
-    <div class="meta-value">${issue.done_ratio}%</div>
-    <div class="progress-track"><div class="progress-bar"></div></div>
-  </div>
-  <div class="meta-item">
-    <div class="meta-label">Due Date</div>
-    <div class="meta-value">${issue.due_date ?? "—"}</div>
-  </div>
-  <div class="meta-item">
-    <div class="meta-label">Created</div>
-    <div class="meta-value">${issue.created_on.split("T")[0]}</div>
-  </div>
-  <div class="meta-item">
-    <div class="meta-label">Updated</div>
-    <div class="meta-value">${issue.updated_on.split("T")[0]}</div>
+  <div class="issue-title">${esc(issue.subject)}</div>
+  <div class="action-bar">
+    <button class="btn btn-primary" onclick="send('pushToAI')">
+      ⚡ Push to AI
+    </button>
+    <button class="btn" onclick="send('openInBrowser')">
+      🌐 Open in Browser
+    </button>
+    <button class="btn" onclick="send('changeStatus')">
+      🔄 Change Status
+    </button>
+    <button class="btn" onclick="send('changeAssignee')">
+      👤 Change Assignee
+    </button>
   </div>
 </div>
 
-${issue.description ? `<div class="section"><h2>Description</h2><div class="rich-text">${renderText(issue.description)}</div></div>` : ""}
+<!-- Body -->
+<div class="body-content">
 
-${attachmentsHtml}
-
-<div class="section">
-  <h2>Comments (${comments.length})</h2>
-  ${commentsHtml || `<div class="empty">No comments yet.</div>`}
-  <div style="margin-top:12px">
-    <div id="replyQuote" class="reply-quote" style="display:none"></div>
-    <textarea id="newComment" rows="3" placeholder="Add a comment..."></textarea>
-    <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
-      <button onclick="addComment()">Add Comment</button>
-      <button id="cancelReply" class="btn-secondary" style="display:none" onclick="cancelReply()">Cancel Reply</button>
+  <!-- Meta info grid -->
+  <div class="meta-grid">
+    <div class="meta-item">
+      <div class="meta-label">Project</div>
+      <div class="meta-value">${esc(issue.project.name)}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">Assignee</div>
+      <div class="meta-value">${esc(issue.assigned_to?.name ?? "—")}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">Author</div>
+      <div class="meta-value">${esc(issue.author.name)}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">Created</div>
+      <div class="meta-value">${formatDate(issue.created_on)}</div>
+    </div>
+    ${
+      issue.due_date
+        ? `<div class="meta-item">
+      <div class="meta-label">Due Date</div>
+      <div class="meta-value">${esc(issue.due_date)}</div>
+    </div>`
+        : ""
+    }
+    <div class="meta-item">
+      <div class="meta-label">Progress</div>
+      <div class="meta-value">${issue.done_ratio}%</div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar"></div>
+      </div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">Updated</div>
+      <div class="meta-value">${formatDate(issue.updated_on)}</div>
     </div>
   </div>
+
+  <!-- Description -->
+  <div class="section">
+    <div class="section-title">Description</div>
+    <div class="description-box">
+      ${
+        issue.description
+          ? `<div class="rich-text">${renderText(issue.description)}</div>`
+          : `<div class="empty-desc">No description provided.</div>`
+      }
+    </div>
+  </div>
+
+  ${buildAttachmentsSection(imageAttachments, fileAttachments)}
+
+  <hr class="section-divider">
+
+  <!-- Comments -->
+  <div class="section">
+    <div class="comments-header">
+      <div class="section-title" style="margin-bottom:0">
+        Comments
+        ${comments.length > 0 ? `<span class="count">${comments.length}</span>` : ""}
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="send('addComment')">+ Add Comment</button>
+    </div>
+
+    ${comments.length === 0 ? `<p style="color:var(--vscode-descriptionForeground);font-style:italic;font-size:0.9em">No comments yet.</p>` : ""}
+
+    ${allJournals
+      .filter((j) => j.notes?.trim() || j.details?.length)
+      .map((j) => buildJournalCard(j))
+      .join("")}
+  </div>
 </div>
 
-${history.length > 0 ? `<div class="section"><h2>History</h2>${historyHtml}</div>` : ""}
-
-<!-- Lightbox -->
-<div class="lightbox" id="lightbox" onclick="closeLightbox()">
-  <button class="lightbox-close" onclick="closeLightbox()">✕</button>
-  <img id="lightboxImg" src="" alt="">
+<div style="text-align:center;padding:20px 24px 12px;color:var(--vscode-descriptionForeground);font-size:0.75em;opacity:0.5;user-select:none;">
+  Redmine Connector v${version}
 </div>
 
 <script>
   const vscode = acquireVsCodeApi();
-  function openInChat() { vscode.postMessage({ command: 'openInChat' }); }
-  function openInBrowser() { vscode.postMessage({ command: 'openInBrowser' }); }
-  function openBrowser(e, url) { e.preventDefault(); vscode.postMessage({ command: 'openInBrowser' }); }
-  function openLightbox(src) {
-    document.getElementById('lightboxImg').src = src;
-    document.getElementById('lightbox').classList.add('open');
-  }
-  function closeLightbox() {
-    document.getElementById('lightbox').classList.remove('open');
-  }
-  function copyImg(id) {
-    vscode.postMessage({ command: 'copyImageToClipboard', id });
+
+  function send(command, extra) {
+    vscode.postMessage(Object.assign({ command }, extra || {}));
   }
 
-  let replyPrefix = '';
-
-  function getCommentData(btn) {
-    const el = btn.closest('[data-id]');
-    const id = parseInt(el.dataset.id);
-    const notes = atob(el.dataset.notes);
-    const author = el.dataset.author;
-    return { id, notes, author };
+  function openModal(src) {
+    document.getElementById('modalImg').src = src;
+    document.getElementById('imgModal').classList.add('open');
   }
-
-  function replyComment(btn) {
-    const { notes, author } = getCommentData(btn);
-    replyPrefix = notes;
-    const quoteEl = document.getElementById('replyQuote');
-    const cancelEl = document.getElementById('cancelReply');
-    quoteEl.style.display = 'block';
-    quoteEl.textContent = author + ' wrote:\n' + notes;
-    cancelEl.style.display = 'inline-block';
-    const textarea = document.getElementById('newComment');
-    textarea.focus();
-    textarea.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  function closeModal() {
+    document.getElementById('imgModal').classList.remove('open');
   }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeModal();
+  });
 
-  function cancelReply() {
-    replyPrefix = '';
-    document.getElementById('replyQuote').style.display = 'none';
-    document.getElementById('cancelReply').style.display = 'none';
-  }
+  // Lazy-load images
+  document.querySelectorAll('img[data-attachment-id]').forEach((img) => {
+    const id = parseInt(img.dataset.attachmentId);
+    const url = img.dataset.src;
+    send('loadImage', { attachmentId: id, url });
+  });
 
-  function addComment() {
-    const textarea = document.getElementById('newComment');
-    const notes = textarea.value.trim();
-    if (!notes) return;
-    const fullNotes = replyPrefix
-      ? replyPrefix.split('\n').map(l => '> ' + l).join('\n') + '\n\n' + notes
-      : notes;
-    vscode.postMessage({ command: 'addComment', notes: fullNotes });
-    textarea.value = '';
-    cancelReply();
-  }
-
-  function editComment(btn) {
-    const { id, notes } = getCommentData(btn);
-    vscode.postMessage({ command: 'editComment', journalId: id, currentText: notes });
-  }
-
-  function deleteComment(btn) {
-    const { id } = getCommentData(btn);
-    vscode.postMessage({ command: 'deleteComment', journalId: id });
-  }
-
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeLightbox(); });
+  window.addEventListener('message', (e) => {
+    const msg = e.data;
+    if (msg.command === 'imageLoaded') {
+      const imgs = document.querySelectorAll('img[data-attachment-id="' + msg.attachmentId + '"]');
+      imgs.forEach((img) => {
+        img.src = msg.dataUrl;
+        img.style.cursor = 'zoom-in';
+        img.onclick = () => openModal(msg.dataUrl);
+      });
+      // Remove loading state from card
+      const cards = document.querySelectorAll('[data-card-id="' + msg.attachmentId + '"]');
+      cards.forEach((c) => c.classList.remove('loading'));
+    }
+    if (msg.command === 'imageError') {
+      const imgs = document.querySelectorAll('img[data-attachment-id="' + msg.attachmentId + '"]');
+      imgs.forEach((img) => { img.alt = 'Failed to load'; img.style.opacity = '0.4'; });
+    }
+  });
 </script>
+
 </body>
 </html>`;
   }
-
-  private buildAttachmentsHtml(
-    attachments: Attachment[],
-    imageDataUrls: Map<number, string>,
-    baseUrl: string
-  ): string {
-    if (attachments.length === 0) return "";
-
-    const cards = attachments.map((att) => {
-      const dataUrl = imageDataUrls.get(att.id);
-      const isImage = isImageAttachment(att);
-      const sizeKb = Math.round(att.filesize / 1024);
-      const openUrl = att.content_url;
-
-      const preview = isImage && dataUrl
-        ? `<img class="attachment-img" src="${dataUrl}" alt="${esc(att.filename)}" onclick="openLightbox('${dataUrl}')">`
-        : `<div class="attachment-img-placeholder">${fileIcon(att.content_type)}</div>`;
-
-      const copyBtn = isImage
-        ? `<button class="copy-img-btn" title="Copy image to clipboard — paste into Cursor/Windsurf chat" onclick="event.stopPropagation();copyImg(${att.id})">📋 Copy</button>`
-        : "";
-
-      return `<div class="attachment-card" title="${esc(att.filename)}" onclick="${isImage && dataUrl ? `openLightbox('${dataUrl}')` : `vscode.postMessage({command:'openAttachment',url:'${openUrl}'})`}">
-        ${preview}
-        <div class="attachment-name">${esc(att.filename)}</div>
-        <div class="attachment-footer">
-          <span class="attachment-size">${sizeKb} KB · ${esc(att.author.name)}</span>
-          ${copyBtn}
-        </div>
-      </div>`;
-    });
-
-    return `<div class="section">
-  <h2>Attachments (${attachments.length})</h2>
-  <div class="attachments-grid">${cards.join("")}</div>
-</div>`;
-  }
-
-  private buildCommentsHtml(
-    comments: Journal[],
-    attachments: Attachment[],
-    imageDataUrls: Map<number, string>,
-    baseUrl: string
-  ): string {
-    if (comments.length === 0) return "";
-    return comments
-      .map((c) => {
-        // Substitute inline image macros before rendering
-        const notesWithImages = c.notes.replace(/!([^!\s]+)!/g, (_, filename) => {
-          const att = attachments.find((a) => a.filename === filename);
-          if (att) {
-            const dataUrl = imageDataUrls.get(att.id);
-            if (dataUrl) return `![${filename}](data:inline:${att.id})`;
-          }
-          return `_[image: ${filename}]_`;
-        });
-        let body = renderText(notesWithImages);
-        // Replace data:inline:<id> placeholders with actual data urls
-        body = body.replace(/data:inline:(\d+)/g, (_, id) => {
-          const dataUrl = imageDataUrls.get(parseInt(id));
-          return dataUrl ?? "";
-        });
-        // Make inline images clickable
-        body = body.replace(/<img([^>]+)src="(data:[^"]+)"([^>]*)>/g,
-          (_, pre, src, post) => `<img${pre}src="${src}"${post} onclick="openLightbox('${src}')" style="cursor:pointer">`
-        );
-
-        // Store notes safely as base64 in data attribute — avoids any escaping issues
-        const notesB64 = Buffer.from(c.notes, "utf8").toString("base64");
-
-        return `<div class="comment" id="journal-${c.id}" data-id="${c.id}" data-notes="${notesB64}" data-author="${esc(c.user.name)}">
-          <div class="comment-header">
-            <strong>${esc(c.user.name)}</strong>
-            <span class="date">${c.created_on.split("T")[0]}</span>
-            <div class="comment-actions">
-              <button class="comment-btn" onclick="replyComment(this)">↩ Reply</button>
-              <button class="comment-btn" onclick="editComment(this)">✏ Edit</button>
-              <button class="comment-btn comment-btn-danger" onclick="deleteComment(this)">🗑 Delete</button>
-            </div>
-          </div>
-          <div class="comment-body rich-text">${body}</div>
-        </div>`;
-      })
-      .join("");
-  }
-
-  private buildHistoryHtml(history: Journal[]): string {
-    return history
-      .map(
-        (h) => `<div class="history-item">
-        <strong>${esc(h.user.name)}</strong> <span class="date">${h.created_on.split("T")[0]}</span>
-        <ul>${h.details.map((d: { name: string; old_value: string; new_value: string }) => `<li>${esc(d.name)}: <em>${esc(d.old_value ?? "—")}</em> → <em>${esc(d.new_value ?? "—")}</em></li>`).join("")}</ul>
-      </div>`
-      )
-      .join("");
-  }
 }
 
-function fileIcon(contentType: string): string {
-  if (contentType.startsWith("image/")) return "🖼";
-  if (contentType.includes("pdf")) return "📄";
-  if (contentType.includes("zip") || contentType.includes("rar")) return "🗜";
-  if (contentType.includes("text")) return "📝";
-  if (contentType.includes("video")) return "🎬";
-  return "📎";
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+interface WebviewMessage {
+  command: string;
+  [key: string]: unknown;
 }
 
-function esc(str: string | undefined): string {
-  if (!str) return "";
-  return str
+function esc(s: string): string {
+  return (s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
 
+function jsStr(s: string): string {
+  return JSON.stringify(s);
+}
+
+function formatDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return iso.split("T")[0];
+  }
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function initials(name: string): string {
+  return name
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((w) => w[0]?.toUpperCase() ?? "")
+    .join("");
+}
+
+function buildAttachmentsSection(images: Attachment[], files: Attachment[]): string {
+  if (images.length === 0 && files.length === 0) return "";
+
+  let html = `<div class="section">
+  <div class="section-title">Attachments <span class="count">${images.length + files.length}</span></div>`;
+
+  if (images.length > 0) {
+    html += `<div class="attachments-grid">`;
+    for (const img of images) {
+      html += `
+      <div class="image-card" data-card-id="${img.id}">
+        <div class="image-placeholder" id="placeholder-${img.id}">Loading...</div>
+        <img
+          data-attachment-id="${img.id}"
+          data-src="${esc(img.content_url)}"
+          src=""
+          alt="${esc(img.filename)}"
+          style="display:none"
+          onload="this.previousElementSibling.style.display='none'; this.style.display='block';"
+        >
+        <div class="img-name" title="${esc(img.filename)}">${esc(img.filename)}</div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  if (files.length > 0) {
+    if (images.length > 0) html += `<div style="height:10px"></div>`;
+    html += `<div class="file-list">`;
+    for (const f of files) {
+      html += `
+      <div class="file-item">
+        📎 <a href="${esc(f.content_url)}" target="_blank">${esc(f.filename)}</a>
+        <span class="file-size">${formatFileSize(f.filesize)}</span>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+function buildJournalCard(j: Journal): string {
+  const hasNotes = !!(j.notes && j.notes.trim());
+  const hasChanges = j.details && j.details.length > 0;
+  const avatar = initials(j.user.name) || "?";
+
+  let html = `<div class="comment-card">
+  <div class="comment-header">
+    <div class="comment-avatar">${esc(avatar)}</div>
+    <span class="comment-author">${esc(j.user.name)}</span>
+    <span class="comment-date">${formatDate(j.created_on)}</span>`;
+
+  if (hasNotes) {
+    html += `
+    <div class="comment-actions">
+      <button class="btn btn-sm" onclick="send('replyComment', { quote: ${jsStr(j.notes)} })">↩ Reply</button>
+      <button class="btn btn-sm" onclick="send('editComment', { journalId: ${j.id}, currentNotes: ${jsStr(j.notes)} })">✏ Edit</button>
+      <button class="btn btn-sm btn-danger" onclick="send('deleteComment', { journalId: ${j.id} })">🗑 Delete</button>
+    </div>`;
+  }
+
+  html += `</div>`;
+
+  if (hasNotes) {
+    html += `<div class="comment-body rich-text">${renderText(j.notes)}</div>`;
+  }
+
+  if (hasChanges) {
+    html += `<div class="journal-changes">`;
+    for (const d of j.details) {
+      const fieldLabel = friendlyFieldName(d.name);
+      html += `<div class="journal-change">
+        <span class="change-field">${esc(fieldLabel)}</span>
+        ${d.old_value ? `<span class="change-old">${esc(d.old_value)}</span> <span class="change-arrow">→</span>` : ""}
+        <span class="change-new">${esc(d.new_value ?? "—")}</span>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+function friendlyFieldName(name: string): string {
+  const map: Record<string, string> = {
+    status_id: "Status",
+    assigned_to_id: "Assignee",
+    priority_id: "Priority",
+    tracker_id: "Tracker",
+    subject: "Subject",
+    description: "Description",
+    done_ratio: "Progress",
+    due_date: "Due Date",
+    start_date: "Start Date",
+    estimated_hours: "Hours",
+    fixed_version_id: "Version",
+  };
+  return map[name] ?? name;
+}
