@@ -36,6 +36,7 @@ export interface Journal {
   user: { id: number; name: string };
   notes: string;
   created_on: string;
+  updated_on?: string;
   details: Array<{ property: string; name: string; old_value: string; new_value: string }>;
 }
 
@@ -131,6 +132,21 @@ export async function getIssue(id: number): Promise<Issue> {
   return res.data.issue;
 }
 
+export interface UploadToken {
+  token: string;
+  filename: string;
+  content_type: string;
+}
+
+export async function uploadAttachment(base64: string, filename: string, contentType: string): Promise<string> {
+  const buffer = Buffer.from(base64, "base64");
+  const res = await getClient().post("/uploads.json", buffer, {
+    headers: { "Content-Type": "application/octet-stream" },
+    params: { filename },
+  });
+  return res.data.upload.token;
+}
+
 export async function updateIssue(
   id: number,
   updates: {
@@ -141,6 +157,7 @@ export async function updateIssue(
     description?: string;
     doneRatio?: number;
     dueDate?: string;
+    uploads?: UploadToken[];
   }
 ): Promise<void> {
   const body: Record<string, unknown> = {};
@@ -151,6 +168,7 @@ export async function updateIssue(
   if (updates.description !== undefined) body["description"] = updates.description;
   if (updates.doneRatio !== undefined) body["done_ratio"] = updates.doneRatio;
   if (updates.dueDate !== undefined) body["due_date"] = updates.dueDate;
+  if (updates.uploads?.length) body["uploads"] = updates.uploads;
   await getClient().put(`/issues/${id}.json`, { issue: body });
 }
 
@@ -201,6 +219,10 @@ export async function createIssue(params: {
 
   const res = await getClient().post("/issues.json", { issue: body });
   return res.data.issue;
+}
+
+export async function deleteAttachment(id: number): Promise<void> {
+  await getClient().delete(`/attachments/${id}.json`);
 }
 
 export async function fetchAttachmentAsDataUrl(url: string): Promise<string> {

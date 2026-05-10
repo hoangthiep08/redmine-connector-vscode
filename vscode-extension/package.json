@@ -39,6 +39,29 @@
           "default": false,
           "description": "Only show issues assigned to me by default"
         },
+        "redmine.defaultStatusMode": {
+          "type": "string",
+          "default": "open",
+          "enum": ["open", "closed", "*", "custom"],
+          "description": "Default status filter mode"
+        },
+        "redmine.defaultStatusIds": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "description": "Specific status IDs to show when defaultStatusMode is custom"
+        },
+        "redmine.defaultAssigneeMode": {
+          "type": "string",
+          "default": "all",
+          "enum": ["all", "me", "custom"],
+          "description": "Default assignee filter: all / me / custom user"
+        },
+        "redmine.defaultAssigneeId": {
+          "type": "string",
+          "default": "",
+          "description": "User ID to filter by when defaultAssigneeMode is custom"
+        },
         "redmine.textFormat": {
           "type": "string",
           "default": "textile",

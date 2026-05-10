@@ -127,20 +127,48 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       const onlyMe = config.get<boolean>("showOnlyAssignedToMe") ?? false;
 
       let assignedToId: string | undefined;
-      if (this.filter.assignedToMe ?? onlyMe) {
+      if (this.filter.assignedToMe) {
         assignedToId = "me";
       } else if (this.filter.assignedToId) {
         assignedToId = this.filter.assignedToId;
+      } else {
+        // No active session filter — apply config defaults
+        const assigneeMode = config.get<string>("defaultAssigneeMode") ?? "all";
+        if (assigneeMode === "me" || onlyMe) {
+          assignedToId = "me";
+        } else if (assigneeMode === "custom") {
+          const cid = config.get<string>("defaultAssigneeId") ?? "";
+          if (cid) assignedToId = cid;
+        }
+      }
+
+      // Resolve status filter: active filter > config defaults
+      let statusId: string;
+      let customStatusIds: string[] = [];
+      if (this.filter.statusId) {
+        statusId = this.filter.statusId;
+      } else {
+        const mode = config.get<string>("defaultStatusMode") ?? "open";
+        if (mode === "custom") {
+          customStatusIds = config.get<string[]>("defaultStatusIds") ?? [];
+          statusId = customStatusIds.length ? "*" : "open";
+        } else {
+          statusId = mode || "open";
+        }
       }
 
       const result = await listIssues({
         projectId: this.filter.projectId || defaultProject || undefined,
-        statusId: this.filter.statusId ?? "open",
+        statusId,
         assignedToId,
         subject: this.filter.subject,
-        limit: 100,
+        limit: 200,
       });
-      this.issues = result.issues;
+
+      // Client-side filter for custom multi-status
+      this.issues = customStatusIds.length
+        ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
+        : result.issues;
     } catch (err) {
       this.error = err instanceof Error ? err.message : String(err);
     } finally {

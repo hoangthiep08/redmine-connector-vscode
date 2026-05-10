@@ -11,10 +11,12 @@ import {
   listProjectMembers,
   listPriorities,
   getCurrentUser,
+  uploadAttachment,
   updateIssue,
   updateJournal,
   deleteJournal,
   fetchAttachmentAsDataUrl,
+  deleteAttachment,
   isImageAttachment,
   getBaseUrl,
 } from "./redmine-client";
@@ -28,6 +30,9 @@ export class IssueWebview {
   private userMap: Record<string, string> = {};
   private priorityMap: Record<string, string> = {};
   private currentUserId: number = -1;
+  private currentUserName: string = "";
+  private allStatuses: IssueStatus[] = [];
+  private allMembers: Member[] = [];
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -62,8 +67,10 @@ export class IssueWebview {
       listPriorities().catch(() => [] as Priority[]),
       getCurrentUser().catch(() => null),
     ]);
-    if (me) this.currentUserId = me.id;
+    if (me) { this.currentUserId = me.id; this.currentUserName = me.name; }
 
+    this.allStatuses = statuses;
+    this.allMembers = members;
     this.statusMap = Object.fromEntries(statuses.map((s) => [String(s.id), s.name]));
     this.priorityMap = Object.fromEntries(priorities.map((p) => [String(p.id), p.name]));
 
@@ -110,6 +117,27 @@ export class IssueWebview {
         );
         break;
 
+      case "updateProgress": {
+        const ratio = msg.ratio as number;
+        try { await updateIssue(this.currentIssue!.id, { doneRatio: ratio }); await this.refresh(); }
+        catch (err) { vscode.window.showErrorMessage(`${err}`); }
+        break;
+      }
+
+      case "updateStatus": {
+        const statusId = msg.statusId as number;
+        try { await updateIssue(this.currentIssue!.id, { statusId }); await this.refresh(); }
+        catch (err) { vscode.window.showErrorMessage(`${err}`); }
+        break;
+      }
+
+      case "updateAssignee": {
+        const assignedToId = msg.assignedToId as number;
+        try { await updateIssue(this.currentIssue!.id, { assignedToId }); await this.refresh(); }
+        catch (err) { vscode.window.showErrorMessage(`${err}`); }
+        break;
+      }
+
       case "changeStatus": {
         let statuses: IssueStatus[];
         try { statuses = await listStatuses(); }
@@ -144,9 +172,19 @@ export class IssueWebview {
 
       case "addComment": {
         const notes = typeof msg.notes === "string" ? msg.notes.trim() : "";
-        if (!notes) return;
-        try { await updateIssue(this.currentIssue!.id, { notes }); await this.refresh(); }
-        catch (err) {
+        const files = Array.isArray(msg.files) ? msg.files as { data: string; filename: string; contentType: string }[] : [];
+        if (!notes && !files.length) return;
+        try {
+          const uploads = await Promise.all(
+            files.map(async (f) => ({
+              token: await uploadAttachment(f.data, f.filename, f.contentType),
+              filename: f.filename,
+              content_type: f.contentType,
+            }))
+          );
+          await updateIssue(this.currentIssue!.id, { notes: notes || undefined, uploads: uploads.length ? uploads : undefined });
+          await this.refresh();
+        } catch (err) {
           vscode.window.showErrorMessage(`${err}`);
           this.panel?.webview.postMessage({ command: "commentError" });
         }
@@ -185,6 +223,18 @@ export class IssueWebview {
         break;
       }
 
+      case "deleteAttachment": {
+        const attachId = msg.attachmentId as number;
+        try {
+          await deleteAttachment(attachId);
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Không thể xóa file: ${err}`);
+          this.panel?.webview.postMessage({ command: "deleteAttachError", attachmentId: attachId });
+        }
+        break;
+      }
+
       case "loadImage": {
         const url = typeof msg.url === "string" ? msg.url : "";
         const attachmentId = msg.attachmentId as number;
@@ -193,6 +243,18 @@ export class IssueWebview {
           this.panel?.webview.postMessage({ command: "imageLoaded", attachmentId, dataUrl });
         } catch {
           this.panel?.webview.postMessage({ command: "imageError", attachmentId });
+        }
+        break;
+      }
+
+      case "loadInlineImage": {
+        const url = typeof msg.url === "string" ? msg.url : "";
+        const iid = msg.iid as number;
+        try {
+          const dataUrl = await fetchAttachmentAsDataUrl(url);
+          this.panel?.webview.postMessage({ command: "inlineImageLoaded", iid, dataUrl });
+        } catch {
+          this.panel?.webview.postMessage({ command: "inlineImageError", iid });
         }
         break;
       }
@@ -206,8 +268,11 @@ export class IssueWebview {
     const comments = journals.filter((j) => j.notes?.trim()).slice().reverse();
     const historyEntries = journals.filter((j) => j.details?.length).slice().reverse();
 
-    const imageAttachments = (issue.attachments ?? []).filter(isImageAttachment);
-    const fileAttachments = (issue.attachments ?? []).filter((a) => !isImageAttachment(a));
+    const allAttachments = issue.attachments ?? [];
+    const imageAttachments = allAttachments.filter(isImageAttachment);
+    const fileAttachments = allAttachments.filter((a) => !isImageAttachment(a));
+    // Map attachmentId → Attachment for journal inline display
+    const attachmentMap = Object.fromEntries(allAttachments.map((a) => [a.id, a]));
 
     const notesMap = Object.fromEntries(
       journals.filter((j) => j.notes).map((j) => [j.id, j.notes])
@@ -247,7 +312,17 @@ export class IssueWebview {
   .badge-tracker { background: var(--vscode-editor-inactiveSelectionBackground); }
   .badge-status { background: color-mix(in srgb,var(--vscode-charts-blue) 18%,transparent); color: var(--vscode-charts-blue); }
   .badge-priority { border: 1px solid var(--vscode-widget-border,#555); color: var(--vscode-descriptionForeground); }
-  .issue-title { font-size: 1.2em; font-weight: 700; line-height: 1.4; margin-bottom: 11px; }
+  .issue-title { font-size: 1.2em; font-weight: 700; line-height: 1.4; margin-bottom: 4px; }
+  .issue-byline { font-size: .78em; color: var(--vscode-descriptionForeground); margin-bottom: 11px; }
+  .byline-sep { margin: 0 4px; opacity: .5; }
+  .meta-select {
+    width: 100%; background: transparent; color: var(--vscode-foreground);
+    border: none; border-bottom: 1px dashed var(--vscode-widget-border,#555);
+    font-family: inherit; font-size: .88em; font-weight: 500; cursor: pointer;
+    padding: 0 2px 1px; outline: none; appearance: auto;
+  }
+  .meta-select:hover { border-bottom-color: var(--vscode-focusBorder); }
+  .meta-select:focus { border-bottom-color: var(--vscode-focusBorder); }
 
   /* ── Buttons ── */
   .action-bar { display: flex; gap: 7px; flex-wrap: wrap; }
@@ -283,7 +358,7 @@ export class IssueWebview {
   .meta-item { background: var(--vscode-editor-background); padding: 9px 13px; }
   .meta-label { font-size: .7em; text-transform: uppercase; letter-spacing: .06em; color: var(--vscode-descriptionForeground); margin-bottom: 3px; font-weight: 600; }
   .meta-value { font-size: .88em; font-weight: 500; }
-  .prog-wrap { background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; height: 5px; margin-top: 5px; overflow: hidden; }
+  .prog-wrap { background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; height: 5px; margin-top: 6px; overflow: hidden; }
   .prog-bar { height: 100%; border-radius: 4px; background: ${progressColor}; width: ${issue.done_ratio}%; }
 
   /* ── Sections ── */
@@ -305,12 +380,30 @@ export class IssueWebview {
   .img-card { border: 1px solid var(--vscode-widget-border,#333); border-radius: 8px; overflow: hidden; background: var(--vscode-editor-inactiveSelectionBackground); max-width: 200px; }
   .img-card img { width: 200px; height: 136px; object-fit: cover; display: block; cursor: zoom-in; }
   .img-placeholder { width: 200px; height: 136px; display: flex; align-items: center; justify-content: center; color: var(--vscode-descriptionForeground); font-size: .8em; }
-  .img-name { font-size: .75em; padding: 5px 8px; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .img-footer { display: flex; align-items: center; padding: 4px 8px; gap: 4px; }
+  .img-name { font-size: .75em; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .img-del-btn {
+    flex-shrink: 0; background: none; border: none; cursor: pointer; padding: 2px 4px;
+    color: var(--vscode-descriptionForeground); font-size: .82em; border-radius: 3px;
+    opacity: 0; transition: opacity .12s;
+  }
+  .img-card:hover .img-del-btn { opacity: 1; }
+  .img-del-btn:hover { background: color-mix(in srgb,var(--vscode-errorForeground) 14%,transparent); color: var(--vscode-errorForeground); }
+  .img-del-confirm { display: none; padding: 5px 8px; background: color-mix(in srgb,var(--vscode-errorForeground) 7%,transparent); border-top: 1px solid color-mix(in srgb,var(--vscode-errorForeground) 22%,transparent); gap: 6px; align-items: center; font-size: .78em; }
+  .img-del-confirm.open { display: flex; }
+  .img-del-confirm span { flex: 1; color: var(--vscode-foreground); }
   .file-list { display: flex; flex-direction: column; gap: 5px; }
   .file-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 5px; font-size: .84em; }
   .file-item a { color: var(--vscode-textLink-foreground); text-decoration: none; flex: 1; }
   .file-item a:hover { text-decoration: underline; }
   .file-size { color: var(--vscode-descriptionForeground); font-size: .84em; white-space: nowrap; }
+  .file-del-btn {
+    background: none; border: none; cursor: pointer; padding: 2px 5px;
+    color: var(--vscode-descriptionForeground); font-size: .82em; border-radius: 3px;
+    opacity: 0; transition: opacity .12s;
+  }
+  .file-item:hover .file-del-btn { opacity: 1; }
+  .file-del-btn:hover { background: color-mix(in srgb,var(--vscode-errorForeground) 14%,transparent); color: var(--vscode-errorForeground); }
 
   /* ── Image modal ── */
   .img-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.88); z-index: 1000; align-items: center; justify-content: center; cursor: zoom-out; }
@@ -334,14 +427,54 @@ export class IssueWebview {
   .tab-pane { display: none; }
   .tab-pane.active { display: block; }
 
-  /* ── Comments header ── */
-  .comments-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  /* ── Compose box (toggle) ── */
+  .add-comment-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-bottom: 14px; padding: 7px 16px;
+    background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+    border: none; border-radius: 6px; cursor: pointer;
+    font-family: inherit; font-size: .86em; font-weight: 500;
+  }
+  .add-comment-btn:hover { opacity: .87; }
+  .compose-box {
+    border: 1px solid var(--vscode-widget-border,#333); border-radius: 8px;
+    margin-bottom: 16px; overflow: hidden;
+    transition: border-color .15s; display: none;
+  }
+  .compose-box.open { display: block; }
+  .compose-box:focus-within { border-color: var(--vscode-focusBorder,#007acc); }
+  .compose-box textarea {
+    border: none; border-radius: 0; min-height: 72px;
+    padding: 11px 13px; resize: none;
+  }
+  .compose-box textarea:focus { border-color: transparent; }
+  .compose-footer {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px; background: var(--vscode-editor-inactiveSelectionBackground);
+    border-top: 1px solid var(--vscode-widget-border,#333);
+  }
+  .attach-btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 9px; cursor: pointer;
+    font-family: inherit; font-size: .79em; font-weight: 500;
+    background: transparent; color: var(--vscode-descriptionForeground);
+    border: 1px solid var(--vscode-widget-border,#555); border-radius: 5px;
+  }
+  .attach-btn:hover { color: var(--vscode-foreground); }
+  .compose-hint { font-size: .75em; color: var(--vscode-descriptionForeground); opacity: .6; }
+  .compose-submit { margin-left: auto; }
 
-  /* ── Add comment box ── */
-  .add-box { border: 1px solid var(--vscode-widget-border,#333); border-radius: 8px; margin-bottom: 12px; overflow: hidden; display: none; }
-  .add-box.open { display: block; }
-  .add-box-head { padding: 7px 13px; background: var(--vscode-editor-inactiveSelectionBackground); font-size: .84em; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
-  .add-box-body { padding: 11px 13px; }
+  /* ── Image previews ── */
+  .img-previews { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--vscode-widget-border,#333); }
+  .img-previews:empty { display: none; }
+  .preview-item { position: relative; width: 72px; height: 72px; }
+  .preview-item img { width: 72px; height: 72px; object-fit: cover; border-radius: 5px; border: 1px solid var(--vscode-widget-border,#333); }
+  .preview-remove {
+    position: absolute; top: -5px; right: -5px; width: 18px; height: 18px;
+    background: var(--vscode-errorForeground); color: #fff;
+    border: none; border-radius: 50%; cursor: pointer;
+    font-size: 11px; line-height: 18px; text-align: center; padding: 0;
+  }
 
   /* ── Textarea ── */
   textarea {
@@ -359,7 +492,9 @@ export class IssueWebview {
   .card-header { display: flex; align-items: center; gap: 8px; padding: 7px 12px; background: var(--vscode-editor-inactiveSelectionBackground); flex-wrap: wrap; }
   .avatar { width: 26px; height: 26px; border-radius: 50%; background: var(--vscode-button-background); color: var(--vscode-button-foreground); display: flex; align-items: center; justify-content: center; font-size: .72em; font-weight: 700; flex-shrink: 0; }
   .card-author { font-weight: 600; font-size: .88em; }
-  .card-date { color: var(--vscode-descriptionForeground); font-size: .77em; }
+  .card-date { color: var(--vscode-descriptionForeground); font-size: .77em; cursor: default; }
+  .card-date:hover { text-decoration: underline dotted; }
+  .edited-badge { font-size: .72em; color: var(--vscode-descriptionForeground); opacity: .7; font-style: italic; }
   .card-actions { margin-left: auto; display: flex; gap: 5px; opacity: 0; transition: opacity .12s; }
   .comment-card:hover .card-actions { opacity: 1; }
   .card-body { padding: 11px 14px; }
@@ -405,11 +540,14 @@ export class IssueWebview {
     <span class="badge badge-priority">⚡ ${esc(issue.priority.name)}</span>
   </div>
   <div class="issue-title">${esc(issue.subject)}</div>
+  <div class="issue-byline">
+    by <strong>${esc(issue.author.name)}</strong>
+    <span class="byline-sep">·</span> Created: ${fmtDate(issue.created_on)}
+    <span class="byline-sep">·</span> Updated: ${fmtDate(issue.updated_on)}
+  </div>
   <div class="action-bar">
     <button class="btn btn-primary" onclick="vsc('pushToAI')">⚡ Push to AI</button>
     <button class="btn" onclick="vsc('openInBrowser')">🌐 Browser</button>
-    <button class="btn" onclick="vsc('changeStatus')">🔄 Status</button>
-    <button class="btn" onclick="vsc('changeAssignee')">👤 Assignee</button>
   </div>
 </div>
 
@@ -422,26 +560,30 @@ export class IssueWebview {
       <div class="meta-value">${esc(issue.project.name)}</div>
     </div>
     <div class="meta-item">
+      <div class="meta-label">Status</div>
+      <select class="meta-select" onchange="vsc('updateStatus',{statusId:parseInt(this.value)})">
+        ${this.allStatuses.map((s) =>
+          `<option value="${s.id}"${s.id === issue.status.id ? " selected" : ""}>${esc(s.name)}</option>`
+        ).join("")}
+      </select>
+    </div>
+    <div class="meta-item">
       <div class="meta-label">Assignee</div>
-      <div class="meta-value">${esc(issue.assigned_to?.name ?? "—")}</div>
+      <select class="meta-select" onchange="vsc('updateAssignee',{assignedToId:parseInt(this.value)})">
+        <option value="0"${!issue.assigned_to ? " selected" : ""}>— Unassigned —</option>
+        ${this.allMembers.map((m) =>
+          `<option value="${m.id}"${issue.assigned_to?.id === m.id ? " selected" : ""}>${esc(m.name)}</option>`
+        ).join("")}
+      </select>
     </div>
-    <div class="meta-item">
-      <div class="meta-label">Author</div>
-      <div class="meta-value">${esc(issue.author.name)}</div>
-    </div>
-    <div class="meta-item">
-      <div class="meta-label">Created</div>
-      <div class="meta-value">${fmtDate(issue.created_on)}</div>
-    </div>
-    ${issue.due_date ? `<div class="meta-item"><div class="meta-label">Due Date</div><div class="meta-value">${esc(issue.due_date)}</div></div>` : ""}
     <div class="meta-item">
       <div class="meta-label">Progress</div>
-      <div class="meta-value">${issue.done_ratio}%</div>
+      <select class="meta-select" onchange="vsc('updateProgress',{ratio:parseInt(this.value)})">
+        ${[0,10,20,30,40,50,60,70,80,90,100].map((v) =>
+          `<option value="${v}"${v === issue.done_ratio ? " selected" : ""}>${v}%</option>`
+        ).join("")}
+      </select>
       <div class="prog-wrap"><div class="prog-bar"></div></div>
-    </div>
-    <div class="meta-item">
-      <div class="meta-label">Updated</div>
-      <div class="meta-value">${fmtDate(issue.updated_on)}</div>
     </div>
   </div>
 
@@ -450,7 +592,7 @@ export class IssueWebview {
     <div class="section-title">Description</div>
     <div class="desc-box">
       ${issue.description
-        ? `<div class="rich-text">${renderText(issue.description)}</div>`
+        ? `<div class="rich-text">${renderText(issue.description, undefined, getBaseUrl())}</div>`
         : `<div class="empty-note">No description provided.</div>`}
     </div>
   </div>
@@ -471,27 +613,29 @@ export class IssueWebview {
 
   <!-- Comments tab -->
   <div class="tab-pane active" id="tab-comments">
-    <div class="comments-top">
-      <span></span>
-      <button class="btn btn-primary btn-sm" onclick="toggleAddForm()">+ Add Comment</button>
-    </div>
 
-    <div class="add-box" id="addBox">
-      <div class="add-box-head">
-        <span>New Comment</span>
-        <button class="btn btn-ghost btn-sm" onclick="toggleAddForm()">✕ Cancel</button>
-      </div>
-      <div class="add-box-body">
-        <textarea id="newCommentText" placeholder="Write your comment..."></textarea>
-        <div class="form-row">
-          <button class="btn btn-primary btn-sm" onclick="submitAdd()">Submit</button>
+    <!-- Toggle compose box -->
+    <button class="add-comment-btn" id="addCommentBtn" onclick="openCompose()">✏ Add Comment</button>
+    <div class="compose-box" id="composeBox">
+      <textarea id="newCommentText" placeholder="Write a comment…"></textarea>
+      <div class="img-previews" id="imgPreviews"></div>
+      <div class="compose-footer">
+        <label class="attach-btn" title="Attach file">
+          📎 Attach
+          <input type="file" id="fileInput" accept="image/*,*/*" multiple style="display:none"
+                 onchange="handleFileInput(this.files)">
+        </label>
+        <span class="compose-hint">click Attach to add files</span>
+        <div style="margin-left:auto;display:flex;gap:6px">
+          <button class="btn btn-ghost btn-sm" onclick="closeCompose()">✕ Close</button>
+          <button class="btn btn-primary btn-sm" id="submitBtn" onclick="submitAdd()">Submit</button>
         </div>
       </div>
     </div>
 
     ${comments.length === 0
       ? `<p class="empty-note">No comments yet.</p>`
-      : comments.map((j) => this.buildCommentHtml(j)).join("")}
+      : comments.map((j) => this.buildCommentHtml(j, attachmentMap)).join("")}
   </div>
 
   <!-- History tab -->
@@ -524,18 +668,77 @@ export class IssueWebview {
   function closeModal() { document.getElementById('imgModal').classList.remove('open'); }
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-  // ── Add comment ───────────────────────────────────────────
-  function toggleAddForm() {
-    const box = document.getElementById('addBox');
-    const open = box.classList.toggle('open');
-    if (open) document.getElementById('newCommentText').focus();
-    else document.getElementById('newCommentText').value = '';
+  // ── Image attachment ──────────────────────────────────────
+  let pendingFiles = []; // { data: base64, filename, contentType, previewUrl }
+
+  function addFileToQueue(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const dataUrl = e.target.result;
+      const base64 = dataUrl.split(',')[1];
+      const id = Date.now() + Math.random();
+      pendingFiles.push({ id, data: base64, filename: file.name, contentType: file.type, previewUrl: dataUrl });
+      renderPreviews();
+    };
+    reader.readAsDataURL(file);
   }
+
+  function renderPreviews() {
+    const container = document.getElementById('imgPreviews');
+    container.innerHTML = '';
+    pendingFiles.forEach(f => {
+      const item = document.createElement('div');
+      item.className = 'preview-item';
+      const isImage = f.contentType.startsWith('image/');
+      if (isImage) {
+        const img = document.createElement('img');
+        img.src = f.previewUrl;
+        img.title = f.filename;
+        item.appendChild(img);
+      } else {
+        item.style.cssText = 'display:flex;align-items:center;justify-content:center;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:5px;border:1px solid var(--vscode-widget-border);font-size:.7em;padding:4px;text-align:center;word-break:break-all;';
+        item.textContent = f.filename;
+      }
+      const rm = document.createElement('button');
+      rm.className = 'preview-remove';
+      rm.textContent = '×';
+      rm.onclick = () => { pendingFiles = pendingFiles.filter(x => x.id !== f.id); renderPreviews(); };
+      item.appendChild(rm);
+      container.appendChild(item);
+    });
+  }
+
+  function handleFileInput(files) {
+    Array.from(files).forEach(f => addFileToQueue(f));
+    document.getElementById('fileInput').value = '';
+  }
+
+
+  // ── Compose toggle ────────────────────────────────────────
+  function openCompose() {
+    document.getElementById('addCommentBtn').style.display = 'none';
+    document.getElementById('composeBox').classList.add('open');
+    document.getElementById('newCommentText').focus();
+  }
+  function closeCompose() {
+    const hasText = document.getElementById('newCommentText').value.trim().length > 0;
+    if (hasText || pendingFiles.length > 0) {
+      if (!confirm('Discard your comment? The content you entered will be lost.')) return;
+    }
+    document.getElementById('composeBox').classList.remove('open');
+    document.getElementById('newCommentText').value = '';
+    pendingFiles = []; renderPreviews();
+    document.getElementById('addCommentBtn').style.display = '';
+  }
+
+  // ── Add comment ───────────────────────────────────────────
   function submitAdd() {
     const notes = document.getElementById('newCommentText').value.trim();
-    if (!notes) return;
-    setSubmitting(event.currentTarget, 'Submitting…');
-    vsc('addComment', { notes });
+    if (!notes && !pendingFiles.length) return;
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true; btn.textContent = 'Submitting…';
+    const files = pendingFiles.map(f => ({ data: f.data, filename: f.filename, contentType: f.contentType }));
+    vsc('addComment', { notes, files });
   }
 
   // ── Reply ─────────────────────────────────────────────────
@@ -574,12 +777,27 @@ export class IssueWebview {
     vsc('editComment', { journalId: id, notes });
   }
 
-  // ── Delete ────────────────────────────────────────────────
+  // ── Delete comment ────────────────────────────────────────
   function showDelete(id) { closeAllForms(); document.getElementById('del-' + id).classList.add('open'); }
   function cancelDelete(id) { document.getElementById('del-' + id).classList.remove('open'); }
   function confirmDelete(id) {
     setSubmitting(event.currentTarget, 'Deleting…');
     vsc('deleteComment', { journalId: id });
+  }
+
+  // ── Delete attachment ─────────────────────────────────────
+  function showDelAttach(id) {
+    document.querySelectorAll('.img-del-confirm.open').forEach(el => el.classList.remove('open'));
+    const el = document.getElementById('del-att-' + id);
+    if (el) el.classList.add('open');
+  }
+  function cancelDelAttach(id) {
+    const el = document.getElementById('del-att-' + id);
+    if (el) el.classList.remove('open');
+  }
+  function confirmDelAttach(id) {
+    setSubmitting(event.currentTarget, 'Deleting…');
+    vsc('deleteAttachment', { attachmentId: id });
   }
 
   // ── Helpers ───────────────────────────────────────────────
@@ -613,32 +831,105 @@ export class IssueWebview {
         btn.textContent = btn.textContent.replace('…', '').replace('Submitting', 'Submit').replace('Posting', 'Post Reply').replace('Saving', 'Save').replace('Deleting', 'Delete');
       });
     }
+    if (msg.command === 'inlineImageLoaded') {
+      document.querySelectorAll('img.rich-img[data-iid="' + msg.iid + '"]').forEach(img => {
+        img.src = msg.dataUrl;
+        img.onclick = () => openModal(msg.dataUrl);
+      });
+    }
+    if (msg.command === 'inlineImageError') {
+      document.querySelectorAll('img.rich-img[data-iid="' + msg.iid + '"]').forEach(img => {
+        img.alt = '⚠ Could not load image'; img.style.opacity = '.4';
+      });
+    }
+    if (msg.command === 'deleteAttachError') {
+      cancelDelAttach(msg.attachmentId);
+      document.querySelectorAll('button[disabled]').forEach(btn => { btn.disabled = false; });
+    }
   });
 
-  // Lazy-load images
+  // ── Relative time ────────────────────────────────────────
+  function timeAgo(iso) {
+    const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (diff < 45)       return 'just now';
+    if (diff < 90)       return 'a minute ago';
+    if (diff < 3300)     return Math.round(diff / 60) + ' minutes ago';
+    if (diff < 5400)     return 'about an hour ago';
+    if (diff < 79200)    return Math.round(diff / 3600) + ' hours ago';
+    if (diff < 129600)   return 'a day ago';
+    if (diff < 561600)   return Math.round(diff / 86400) + ' days ago';
+    if (diff < 1036800)  return 'a week ago';
+    if (diff < 2419200)  return Math.round(diff / 604800) + ' weeks ago';
+    if (diff < 31536000) return Math.round(diff / 2592000) + ' months ago';
+    return Math.round(diff / 31536000) + ' years ago';
+  }
+  function fmtFull(iso) {
+    return new Date(iso).toLocaleString(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric',
+      hour: '2-digit', minute: '2-digit'
+    });
+  }
+  document.querySelectorAll('time[data-iso]').forEach(el => {
+    el.textContent = timeAgo(el.dataset.iso);
+    el.title = fmtFull(el.dataset.iso);
+  });
+
+  // Lazy-load attachment images
   document.querySelectorAll('img[data-aid]').forEach(img => {
     vsc('loadImage', { attachmentId: parseInt(img.dataset.aid), url: img.dataset.src });
+  });
+
+  // Lazy-load inline images inside rich text (comments, description)
+  let _iid = 0;
+  document.querySelectorAll('img.rich-img[data-src]').forEach(img => {
+    const id = ++_iid;
+    img.dataset.iid = id;
+    vsc('loadInlineImage', { iid: id, url: img.dataset.src });
   });
 </script>
 </body>
 </html>`;
   }
 
-  private buildCommentHtml(j: Journal): string {
+  private buildCommentHtml(j: Journal, attachmentMap: Record<number, Attachment> = {}): string {
     const av = esc(initials(j.user.name));
     const isOwn = j.user.id === this.currentUserId;
+    const isEdited = !!(j.updated_on && j.updated_on !== j.created_on);
+
+    // Images attached with this journal entry
+    const journalImages = (j.details ?? [])
+      .filter((d) => d.property === "attachment" && d.new_value && !d.old_value)
+      .map((d) => attachmentMap[Number(d.name)])
+      .filter((a): a is Attachment => !!a && isImageAttachment(a));
+
+    const journalFiles = (j.details ?? [])
+      .filter((d) => d.property === "attachment" && d.new_value && !d.old_value)
+      .map((d) => attachmentMap[Number(d.name)])
+      .filter((a): a is Attachment => !!a && !isImageAttachment(a));
+
+    const attachHtml = [
+      ...journalImages.map((a) => `
+        <div class="j-img-wrap">
+          <div class="img-placeholder" style="width:100%;height:90px">Loading…</div>
+          <img data-aid="${a.id}" data-src="${esc(a.content_url)}" src="" alt="${esc(a.filename)}" style="display:none;max-width:260px;border-radius:6px;cursor:zoom-in;margin-top:6px">
+        </div>`),
+      ...journalFiles.map((a) => `
+        <div class="file-item" style="margin-top:6px">📎 <a href="${esc(a.content_url)}" target="_blank">${esc(a.filename)}</a><span class="file-size">${fmtSize(a.filesize)}</span></div>`),
+    ].join("");
+
     return `<div class="comment-card">
   <div class="card-header">
     <div class="avatar">${av}</div>
     <span class="card-author">${esc(j.user.name)}</span>
-    <span class="card-date">${fmtDate(j.created_on)}</span>
+    <time class="card-date" data-iso="${esc(j.created_on)}">${fmtDate(j.created_on)}</time>
+    ${isEdited ? `<span class="edited-badge">· Edited</span>` : ""}
     <div class="card-actions">
       <button class="btn btn-ghost btn-sm" onclick="showReply(${j.id})">↩ Reply</button>
       ${isOwn ? `<button class="btn btn-ghost btn-sm" onclick="showEdit(${j.id})">✏ Edit</button>
       <button class="btn btn-danger btn-sm" onclick="showDelete(${j.id})">🗑</button>` : ""}
     </div>
   </div>
-  <div class="card-body rich-text" id="body-${j.id}">${renderText(j.notes)}</div>
+  <div class="card-body rich-text" id="body-${j.id}">${renderText(j.notes, undefined, getBaseUrl())}${attachHtml}</div>
 
   <div class="inline-form" id="reply-form-${j.id}">
     <textarea id="reply-ta-${j.id}" placeholder="Write your reply..."></textarea>
@@ -671,7 +962,7 @@ export class IssueWebview {
   <div class="history-header">
     <div class="avatar">${av}</div>
     <span class="card-author">${esc(j.user.name)}</span>
-    <span class="card-date">${fmtDate(j.created_on)}</span>
+    <time class="card-date" data-iso="${esc(j.created_on)}">${fmtDate(j.created_on)}</time>
   </div>
   <div class="history-body">`;
 
@@ -704,10 +995,18 @@ export class IssueWebview {
     if (images.length) {
       html += `<div class="attach-grid">`;
       for (const img of images) {
-        html += `<div class="img-card">
+        html += `<div class="img-card" id="att-card-${img.id}">
       <div class="img-placeholder">Loading…</div>
       <img data-aid="${img.id}" data-src="${esc(img.content_url)}" src="" alt="${esc(img.filename)}" style="display:none">
-      <div class="img-name" title="${esc(img.filename)}">${esc(img.filename)}</div>
+      <div class="img-footer">
+        <span class="img-name" title="${esc(img.filename)}">${esc(img.filename)}</span>
+        <button class="img-del-btn" onclick="showDelAttach(${img.id})" title="Delete attachment">🗑</button>
+      </div>
+      <div class="img-del-confirm" id="del-att-${img.id}">
+        <span>Delete this file?</span>
+        <button class="btn btn-danger btn-sm" onclick="confirmDelAttach(${img.id})">Delete</button>
+        <button class="btn btn-ghost btn-sm" onclick="cancelDelAttach(${img.id})">Cancel</button>
+      </div>
     </div>`;
       }
       html += `</div>`;
@@ -717,7 +1016,7 @@ export class IssueWebview {
       if (images.length) html += `<div style="height:8px"></div>`;
       html += `<div class="file-list">`;
       for (const f of files) {
-        html += `<div class="file-item">📎 <a href="${esc(f.content_url)}" target="_blank">${esc(f.filename)}</a><span class="file-size">${fmtSize(f.filesize)}</span></div>`;
+        html += `<div class="file-item" id="att-card-${f.id}">📎 <a href="${esc(f.content_url)}" target="_blank">${esc(f.filename)}</a><span class="file-size">${fmtSize(f.filesize)}</span><button class="file-del-btn" onclick="showDelAttach(${f.id})" title="Delete attachment">🗑</button></div>`;
       }
       html += `</div>`;
     }

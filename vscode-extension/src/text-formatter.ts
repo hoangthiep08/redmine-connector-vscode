@@ -8,26 +8,32 @@ export function getConfiguredFormat(): TextFormat {
   return val as TextFormat;
 }
 
-export function renderText(text: string, format?: TextFormat): string {
+export function renderText(text: string, format?: TextFormat, baseUrl?: string): string {
   if (!text) return "";
   const fmt = format ?? getConfiguredFormat();
-  if (fmt === "markdown") return renderMarkdown(text);
-  if (fmt === "textile") return renderTextile(text);
+  if (fmt === "markdown") return renderMarkdown(text, baseUrl);
+  if (fmt === "textile") return renderTextile(text, baseUrl);
   return `<p style="white-space:pre-wrap">${escHtml(text)}</p>`;
 }
 
 // ── Markdown ────────────────────────────────────────────────────────────────
 
-function renderMarkdown(text: string): string {
+function renderMarkdown(text: string, baseUrl?: string): string {
   marked.use({ breaks: true, gfm: true, async: false });
-  const result = marked.parse(text);
-  return typeof result === "string" ? result : escHtml(text);
+  let result = marked.parse(text);
+  if (typeof result !== "string") return escHtml(text);
+  // Proxy image src through extension (Redmine requires auth)
+  result = result.replace(/<img([^>]*)\ssrc="([^"]*)"([^>]*?)>/gi, (_, pre, src, post) => {
+    const fullSrc = src.startsWith("/") && baseUrl ? `${baseUrl}${src}` : src;
+    return `<img${pre} class="rich-img" data-src="${fullSrc.replace(/"/g, "&quot;")}" src=""${post}>`;
+  });
+  return result;
 }
 
 // ── Textile ─────────────────────────────────────────────────────────────────
 // Covers the subset Redmine actually uses.
 
-function renderTextile(raw: string): string {
+function renderTextile(raw: string, baseUrl?: string): string {
   let text = raw;
 
   // Protect code blocks first (pre/code)
@@ -54,6 +60,12 @@ function renderTextile(raw: string): string {
   text = text.replace(/_([^_\n]+?)_/g, "<em>$1</em>");
   text = text.replace(/\+([^+\n]+?)\+/g, "<ins>$1</ins>");
   text = text.replace(/-([^-\n]+?)-/g, "<del>$1</del>");
+
+  // Images: !url! or !url(title)!
+  text = text.replace(/!([^!\s<>]+?)(?:\(([^)]*)\))?!/g, (_, url, title) => {
+    const fullSrc = url.startsWith("/") && baseUrl ? `${baseUrl}${url}` : url;
+    return `<img class="rich-img" data-src="${fullSrc.replace(/"/g, "&quot;")}" src="" alt="${escHtml(title || '')}">`;
+  });
 
   // Links: "text":url
   text = text.replace(/"([^"]+)":(\S+)/g, '<a href="$2" target="_blank">$1</a>');
