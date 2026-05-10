@@ -7,6 +7,8 @@ export interface IssueFilter {
   statusId?: string;
   statusName?: string;
   assignedToMe?: boolean;
+  assignedToId?: string;
+  assignedToName?: string;
   subject?: string;
 }
 
@@ -124,10 +126,17 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       const defaultProject = config.get<string>("defaultProject") ?? "";
       const onlyMe = config.get<boolean>("showOnlyAssignedToMe") ?? false;
 
+      let assignedToId: string | undefined;
+      if (this.filter.assignedToMe ?? onlyMe) {
+        assignedToId = "me";
+      } else if (this.filter.assignedToId) {
+        assignedToId = this.filter.assignedToId;
+      }
+
       const result = await listIssues({
         projectId: this.filter.projectId || defaultProject || undefined,
         statusId: this.filter.statusId ?? "open",
-        assignedToId: (this.filter.assignedToMe ?? onlyMe) ? "me" : undefined,
+        assignedToId,
         subject: this.filter.subject,
         limit: 100,
       });
@@ -177,6 +186,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     else if (this.filter.statusId === "*") parts.push("🔵 All statuses");
     else if (this.filter.statusId === "closed") parts.push("🔵 Closed");
     if (this.filter.assignedToMe) parts.push("👤 Assigned to me");
+    else if (this.filter.assignedToName) parts.push(`👤 ${this.filter.assignedToName}`);
     if (this.filter.subject) parts.push(`🔍 "${this.filter.subject}"`);
     return parts.join("  ");
   }

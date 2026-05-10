@@ -216,7 +216,8 @@ export function activate(context: vscode.ExtensionContext) {
 
     ["redmine.filter", async (...args: unknown[]) => {
       const focusOn = args[0] as string | undefined;
-      // Load projects & statuses in parallel
+
+      // Load projects & statuses once before the loop
       let projects: Project[] = [];
       let statuses: IssueStatus[] = [];
       try {
@@ -226,94 +227,138 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const cur = provider.getFilter();
+      let firstRun = true;
 
-      // Build filter option list
-      const projectLabel = cur.projectName ? `Project: ${cur.projectName}` : "Project: All";
-      const statusLabel = cur.statusName
-        ? `Status: ${cur.statusName}`
-        : cur.statusId === "*"
-        ? "Status: All"
-        : cur.statusId === "closed"
-        ? "Status: Closed"
-        : "Status: Open";
-      const assignLabel = cur.assignedToMe ? "Assigned to: Me ✓" : "Assigned to: Everyone";
-      const searchLabel = cur.subject ? `Search: "${cur.subject}"` : "Search: —";
-      const hasFilter = cur.projectId || (cur.statusId && cur.statusId !== "open") || cur.assignedToMe || cur.subject;
+      // Loop: stay in filter menu until user presses Esc
+      while (true) {
+        const cur = provider.getFilter();
 
-      const options = [
-        { label: `$(folder) ${projectLabel}`, id: "project" },
-        { label: `$(circle-filled) ${statusLabel}`, id: "status" },
-        { label: `$(person) ${assignLabel}`, id: "assign" },
-        { label: `$(search) ${searchLabel}`, id: "search" },
-        ...(hasFilter ? [{ label: "$(trash) Clear all filters", id: "clear" }] : []),
-      ];
+        const projectLabel = cur.projectName ? `Project: ${cur.projectName}` : "Project: All";
+        const statusLabel = cur.statusName
+          ? `Status: ${cur.statusName}`
+          : cur.statusId === "*"
+          ? "Status: All"
+          : cur.statusId === "closed"
+          ? "Status: Closed"
+          : "Status: Open";
+        const assignLabel = cur.assignedToMe
+          ? "Assignee: Me ✓"
+          : cur.assignedToName
+          ? `Assignee: ${cur.assignedToName}`
+          : "Assignee: Everyone";
+        const searchLabel = cur.subject ? `Search: "${cur.subject}"` : "Search: —";
+        const hasFilter =
+          cur.projectId ||
+          (cur.statusId && cur.statusId !== "open") ||
+          cur.assignedToMe ||
+          cur.assignedToId ||
+          cur.subject;
 
-      const picked = await vscode.window.showQuickPick(options, {
-        title: "Filter Issues",
-        placeHolder: "Select a filter to change",
-        // Pre-focus on the relevant section if called from specific command
-        ...(focusOn === "project" ? { activeItems: [options[0]] } : {}),
-        ...(focusOn === "status" ? { activeItems: [options[1]] } : {}),
-      });
-      if (!picked) return;
-
-      if (picked.id === "clear") {
-        provider.clearFilter();
-        return;
-      }
-
-      if (picked.id === "project") {
-        const projectPicks = [
-          { label: "All Projects", id: "", name: "" },
-          ...projects.map((p) => ({ label: p.name, id: p.identifier, name: p.name })),
+        const options = [
+          { label: `$(folder) ${projectLabel}`, id: "project" },
+          { label: `$(circle-filled) ${statusLabel}`, id: "status" },
+          { label: `$(person) ${assignLabel}`, id: "assign" },
+          { label: `$(search) ${searchLabel}`, id: "search" },
+          ...(hasFilter ? [{ label: "$(trash) Clear all filters", id: "clear" }] : []),
         ];
-        const p = await vscode.window.showQuickPick(projectPicks, {
-          title: "Filter by Project",
-          placeHolder: cur.projectName ? `Current: ${cur.projectName}` : "All projects",
-        });
-        if (!p) return;
-        provider.setFilter({ ...cur, projectId: p.id || undefined, projectName: p.name || undefined });
-      }
 
-      if (picked.id === "status") {
-        const statusPicks = [
-          { label: "Open (default)", id: "open", name: "Open" },
-          { label: "Closed", id: "closed", name: "Closed" },
-          { label: "All statuses", id: "*", name: "" },
-          { label: "──────────", id: "", name: "", kind: vscode.QuickPickItemKind.Separator },
-          ...statuses.map((s) => ({ label: s.name, id: String(s.id), name: s.name })),
-        ];
-        const s = await vscode.window.showQuickPick(statusPicks, {
-          title: "Filter by Status",
-          placeHolder: statusLabel,
+        const picked = await vscode.window.showQuickPick(options, {
+          title: "Filter Issues  (Esc to close)",
+          placeHolder: "Select a filter to change — Esc to close",
+          ...(firstRun && focusOn === "project" ? { activeItems: [options[0]] } : {}),
+          ...(firstRun && focusOn === "status" ? { activeItems: [options[1]] } : {}),
         });
-        if (!s || !s.id) return;
-        provider.setFilter({ ...cur, statusId: s.id, statusName: s.name || undefined });
-      }
+        firstRun = false;
 
-      if (picked.id === "assign") {
-        const assignPicks = [
-          { label: "Everyone", id: "all" },
-          { label: "Assigned to me", id: "me" },
-        ];
-        const a = await vscode.window.showQuickPick(assignPicks, {
-          title: "Filter by Assignee",
-          placeHolder: assignLabel,
-        });
-        if (!a) return;
-        provider.setFilter({ ...cur, assignedToMe: a.id === "me" });
-      }
+        if (!picked) break; // Esc → exit
 
-      if (picked.id === "search") {
-        const keyword = await vscode.window.showInputBox({
-          title: "Search in issue subjects",
-          value: cur.subject ?? "",
-          placeHolder: "Type a keyword...",
-          prompt: "Leave empty to clear search",
-        });
-        if (keyword === undefined) return;
-        provider.setFilter({ ...cur, subject: keyword.trim() || undefined });
+        if (picked.id === "clear") {
+          provider.clearFilter();
+          break;
+        }
+
+        if (picked.id === "project") {
+          const projectPicks = [
+            { label: "All Projects", id: "", name: "" },
+            ...projects.map((p) => ({ label: p.name, id: p.identifier, name: p.name })),
+          ];
+          const p = await vscode.window.showQuickPick(projectPicks, {
+            title: "Filter by Project",
+            placeHolder: cur.projectName ? `Current: ${cur.projectName}` : "All projects",
+          });
+          if (p) {
+            provider.setFilter({ ...cur, projectId: p.id || undefined, projectName: p.name || undefined });
+          }
+          continue; // back to main menu
+        }
+
+        if (picked.id === "status") {
+          const statusPicks = [
+            { label: "Open (default)", id: "open", name: "Open" },
+            { label: "Closed", id: "closed", name: "Closed" },
+            { label: "All statuses", id: "*", name: "" },
+            { label: "──────────", id: "", name: "", kind: vscode.QuickPickItemKind.Separator },
+            ...statuses.map((s) => ({ label: s.name, id: String(s.id), name: s.name })),
+          ];
+          const s = await vscode.window.showQuickPick(statusPicks, {
+            title: "Filter by Status",
+            placeHolder: statusLabel,
+          });
+          if (s && s.id) {
+            provider.setFilter({ ...cur, statusId: s.id, statusName: s.name || undefined });
+          }
+          continue;
+        }
+
+        if (picked.id === "assign") {
+          const projectId = cur.projectId;
+          const memberPicks: { label: string; description?: string; id: string; name: string }[] = [
+            { label: "$(globe) Everyone", id: "all", name: "" },
+            { label: "$(person) Assigned to me", id: "me", name: "me" },
+          ];
+
+          if (projectId) {
+            try {
+              const members = await listProjectMembers(projectId);
+              if (members.length > 0) {
+                memberPicks.push({ label: "──────────", id: "_sep", name: "_sep", description: "" });
+                for (const m of members) {
+                  memberPicks.push({ label: m.name, description: m.roles.join(", "), id: String(m.id), name: m.name });
+                }
+              }
+            } catch { /* skip */ }
+          } else {
+            memberPicks.push({ label: "$(info) Select a project first to filter by user", id: "_hint", name: "_hint" });
+          }
+
+          const a = await vscode.window.showQuickPick(memberPicks, {
+            title: "Filter by Assignee",
+            placeHolder: assignLabel,
+          });
+          if (a && a.id !== "_sep" && a.id !== "_hint") {
+            if (a.id === "all") {
+              provider.setFilter({ ...cur, assignedToMe: false, assignedToId: undefined, assignedToName: undefined });
+            } else if (a.id === "me") {
+              provider.setFilter({ ...cur, assignedToMe: true, assignedToId: undefined, assignedToName: undefined });
+            } else {
+              provider.setFilter({ ...cur, assignedToMe: false, assignedToId: a.id, assignedToName: a.name });
+            }
+          }
+          continue;
+        }
+
+        if (picked.id === "search") {
+          const keyword = await vscode.window.showInputBox({
+            title: "Search in issue subjects",
+            value: cur.subject ?? "",
+            placeHolder: "Type a keyword...",
+            prompt: "Leave empty to clear search",
+          });
+          if (keyword !== undefined) {
+            provider.setFilter({ ...cur, subject: keyword.trim() || undefined });
+          }
+          continue;
+        }
       }
     }],
 

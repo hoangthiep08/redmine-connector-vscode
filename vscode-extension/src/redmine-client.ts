@@ -58,6 +58,12 @@ export interface Member {
   roles: string[];
 }
 
+export interface Priority {
+  id: number;
+  name: string;
+  is_default: boolean;
+}
+
 let httpClient: AxiosInstance | null = null;
 let currentBaseUrl = "";
 let currentApiKey = "";
@@ -103,12 +109,19 @@ export async function listIssues(params: {
   return res.data;
 }
 
+export async function getCurrentUser(): Promise<{ id: number; name: string; login: string }> {
+  const res = await getClient().get("/users/current.json");
+  return res.data.user;
+}
+
 export async function updateJournal(journalId: number, notes: string): Promise<void> {
   await getClient().put(`/journals/${journalId}.json`, { journal: { notes } });
 }
 
 export async function deleteJournal(journalId: number): Promise<void> {
-  await getClient().delete(`/journals/${journalId}.json`);
+  // Redmine REST API has no DELETE endpoint for journals.
+  // Clearing notes via PUT is the only supported way to remove a comment.
+  await getClient().put(`/journals/${journalId}.json`, { journal: { notes: "" } });
 }
 
 export async function getIssue(id: number): Promise<Issue> {
@@ -162,6 +175,11 @@ export async function listProjectMembers(projectId: string): Promise<Member[]> {
       name: m.user!.name,
       roles: m.roles.map((r) => r.name),
     }));
+}
+
+export async function listPriorities(): Promise<Priority[]> {
+  const res = await getClient().get("/enumerations/issue_priorities.json");
+  return res.data.issue_priorities;
 }
 
 export async function createIssue(params: {
