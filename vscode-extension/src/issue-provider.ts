@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { Issue, listIssues } from "./redmine-client";
+import { Issue, listIssues, getIssue } from "./redmine-client";
 
 export interface IssueFilter {
   projectId?: string;
@@ -57,6 +57,34 @@ export class IssueTreeItem extends vscode.TreeItem {
   }
 }
 
+export type GroupByMode = "none" | "project" | "status";
+
+export class ProjectGroupItem extends vscode.TreeItem {
+  constructor(
+    public readonly projectName: string,
+    public readonly projectId: number,
+    count: number,
+  ) {
+    super(projectName, vscode.TreeItemCollapsibleState.Expanded);
+    this.description = `${count} issue${count !== 1 ? "s" : ""}`;
+    this.iconPath = new vscode.ThemeIcon("folder-opened", new vscode.ThemeColor("notificationsInfoIcon.foreground"));
+    this.contextValue = "projectGroup";
+  }
+}
+
+export class StatusGroupItem extends vscode.TreeItem {
+  constructor(
+    public readonly statusName: string,
+    public readonly statusId: number,
+    count: number,
+  ) {
+    super(statusName, vscode.TreeItemCollapsibleState.Expanded);
+    this.description = `${count} issue${count !== 1 ? "s" : ""}`;
+    this.iconPath = new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.blue"));
+    this.contextValue = "statusGroup";
+  }
+}
+
 class ActiveFilterItem extends vscode.TreeItem {
   constructor(label: string) {
     super(label, vscode.TreeItemCollapsibleState.None);
@@ -97,6 +125,16 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private loading = false;
   private error: string | null = null;
   private filter: IssueFilter = {};
+  private groupBy: GroupByMode = "project";
+
+  setGroupBy(mode: GroupByMode) {
+    this.groupBy = mode;
+    this._onDidChangeTreeData.fire(null);
+  }
+
+  getGroupBy(): GroupByMode {
+    return this.groupBy;
+  }
 
   setFilter(filter: IssueFilter) {
     this.filter = filter;
@@ -105,6 +143,56 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
   getFilter(): IssueFilter {
     return this.filter;
+  }
+
+  /** Merges session filter with config defaults — reflects what is actually applied. */
+  getEffectiveFilter(): IssueFilter {
+    const config = vscode.workspace.getConfiguration("redmine");
+    const eff: IssueFilter = { ...this.filter };
+
+    // Project: session → config
+    if (!eff.projectId) {
+      const def = config.get<string>("defaultProject") ?? "";
+      if (def) {
+        eff.projectId = def;
+        eff.projectName = config.get<string>("defaultProjectName") || def;
+      }
+    }
+
+    // Status: session → config
+    if (!eff.statusId) {
+      const mode = config.get<string>("defaultStatusMode") ?? "open";
+      if (mode === "closed")       { eff.statusId = "closed"; eff.statusName = "Closed"; }
+      else if (mode === "*")       { eff.statusId = "*";      eff.statusName = "All statuses"; }
+      else if (mode === "custom")  {
+        const ids = config.get<string[]>("defaultStatusIds") ?? [];
+        eff.statusId = ids.length ? "*" : "open";
+        eff.statusName = ids.length ? `Custom (${ids.length})` : undefined;
+      }
+      // "open" = default, leave unset so label stays clean
+    }
+
+    // Assignee: session → config
+    if (!eff.assignedToMe && !eff.assignedToId) {
+      const mode = config.get<string>("defaultAssigneeMode") ?? "all";
+      if (mode === "me") {
+        eff.assignedToMe = true;
+      } else if (mode === "custom") {
+        const id = config.get<string>("defaultAssigneeId") ?? "";
+        if (id) {
+          eff.assignedToId = id;
+          eff.assignedToName = config.get<string>("defaultAssigneeName") || undefined;
+        }
+      }
+    }
+
+    return eff;
+  }
+
+  /** True when there are session-level overrides (not just config defaults). */
+  hasSessionFilter(): boolean {
+    const f = this.filter;
+    return !!(f.projectId || f.statusId || f.assignedToMe || f.assignedToId || f.subject);
   }
 
   clearFilter() {
@@ -157,22 +245,36 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         }
       }
 
-      const result = await listIssues({
-        projectId: this.filter.projectId || defaultProject || undefined,
-        statusId,
-        assignedToId,
-        subject: this.filter.subject,
-        limit: 200,
-      });
+      // If search term is a number or #number, fetch that issue directly by ID
+      const subjectTerm = this.filter.subject?.trim() ?? "";
+      const idMatch = /^#?(\d+)$/.exec(subjectTerm);
 
-      // Client-side filter for custom multi-status
-      this.issues = customStatusIds.length
-        ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
-        : result.issues;
+      if (idMatch) {
+        try {
+          const issue = await getIssue(parseInt(idMatch[1], 10));
+          this.issues = [issue];
+        } catch {
+          this.issues = [];
+        }
+      } else {
+        const result = await listIssues({
+          projectId: this.filter.projectId || defaultProject || undefined,
+          statusId,
+          assignedToId,
+          subject: this.filter.subject,
+          limit: 200,
+        });
+
+        // Client-side filter for custom multi-status
+        this.issues = customStatusIds.length
+          ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
+          : result.issues;
+      }
     } catch (err) {
       this.error = err instanceof Error ? err.message : String(err);
     } finally {
       this.loading = false;
+      vscode.commands.executeCommand("setContext", "redmine.hasActiveFilter", this.hasSessionFilter());
       this._onDidChangeTreeData.fire(null);
     }
   }
@@ -181,7 +283,21 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     return element;
   }
 
-  getChildren(): vscode.TreeItem[] {
+  getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
+    // Children of a project group
+    if (element instanceof ProjectGroupItem) {
+      return this.issues
+        .filter((i) => i.project.id === element.projectId)
+        .map((i) => new IssueTreeItem(i));
+    }
+    // Children of a status group
+    if (element instanceof StatusGroupItem) {
+      return this.issues
+        .filter((i) => i.status.id === element.statusId)
+        .map((i) => new IssueTreeItem(i));
+    }
+
+    // Root level
     if (this.loading) return [new LoadingItem()];
 
     if (this.error) {
@@ -192,30 +308,56 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     }
 
     const items: vscode.TreeItem[] = [];
-
     const filterLabel = this.buildFilterLabel();
-    if (filterLabel) {
-      items.push(new ActiveFilterItem(filterLabel));
-    }
+    if (filterLabel) items.push(new ActiveFilterItem(filterLabel));
 
     if (this.issues.length === 0) {
       items.push(new EmptyItem("No issues found"));
-    } else {
-      items.push(...this.issues.map((i) => new IssueTreeItem(i)));
+      return items;
     }
 
+    if (this.groupBy === "project") {
+      const map = new Map<number, { name: string; issues: Issue[] }>();
+      for (const issue of this.issues) {
+        if (!map.has(issue.project.id))
+          map.set(issue.project.id, { name: issue.project.name, issues: [] });
+        map.get(issue.project.id)!.issues.push(issue);
+      }
+      if (map.size > 1) {
+        for (const [projectId, { name, issues }] of map)
+          items.push(new ProjectGroupItem(name, projectId, issues.length));
+        return items;
+      }
+    } else if (this.groupBy === "status") {
+      const map = new Map<number, { name: string; issues: Issue[] }>();
+      for (const issue of this.issues) {
+        if (!map.has(issue.status.id))
+          map.set(issue.status.id, { name: issue.status.name, issues: [] });
+        map.get(issue.status.id)!.issues.push(issue);
+      }
+      if (map.size > 1) {
+        for (const [statusId, { name, issues }] of map)
+          items.push(new StatusGroupItem(name, statusId, issues.length));
+        return items;
+      }
+    }
+
+    // Flat (groupBy === "none" or single group)
+    items.push(...this.issues.map((i) => new IssueTreeItem(i)));
     return items;
   }
 
   private buildFilterLabel(): string {
+    const eff = this.getEffectiveFilter();
     const parts: string[] = [];
-    if (this.filter.projectName) parts.push(`📁 ${this.filter.projectName}`);
-    if (this.filter.statusName) parts.push(`🔵 ${this.filter.statusName}`);
-    else if (this.filter.statusId === "*") parts.push("🔵 All statuses");
-    else if (this.filter.statusId === "closed") parts.push("🔵 Closed");
-    if (this.filter.assignedToMe) parts.push("👤 Assigned to me");
-    else if (this.filter.assignedToName) parts.push(`👤 ${this.filter.assignedToName}`);
-    if (this.filter.subject) parts.push(`🔍 "${this.filter.subject}"`);
+    if (eff.projectName)    parts.push(`📁 ${eff.projectName}`);
+    if (eff.statusName)     parts.push(`🔵 ${eff.statusName}`);
+    else if (eff.statusId === "*")      parts.push("🔵 All statuses");
+    else if (eff.statusId === "closed") parts.push("🔵 Closed");
+    if (eff.assignedToMe)        parts.push("👤 Assigned to me");
+    else if (eff.assignedToName) parts.push(`👤 ${eff.assignedToName}`);
+    else if (eff.assignedToId)   parts.push("👤 Custom user");
+    if (eff.subject) parts.push(`🔍 "${eff.subject}"`);
     return parts.join("  ");
   }
 

@@ -60,18 +60,25 @@ export class SettingsWebview {
     this.panel.webview.html = buildHtml(init, projects, statuses, members, logoUri.toString());
 
     this.panel.webview.onDidReceiveMessage(async (msg) => {
+      if (msg.command === "openFeedback") {
+        vscode.commands.executeCommand("redmine.feedback");
+        return;
+      }
+
       // ── Save ──────────────────────────────────────────────────────────────
       if (msg.command === "save") {
         const c = vscode.workspace.getConfiguration("redmine");
         await c.update("baseUrl",               (msg.baseUrl as string).trim().replace(/\/$/, ""), vscode.ConfigurationTarget.Global);
         await c.update("apiKey",                (msg.apiKey as string).trim(),                    vscode.ConfigurationTarget.Global);
         await c.update("defaultProject",        (msg.defaultProject as string).trim(),            vscode.ConfigurationTarget.Global);
+        await c.update("defaultProjectName",    (msg.defaultProjectName as string ?? "").trim(),  vscode.ConfigurationTarget.Global);
         await c.update("showOnlyAssignedToMe",  msg.defaultAssigneeMode === "me",                 vscode.ConfigurationTarget.Global);
         await c.update("textFormat",            msg.textFormat,                                   vscode.ConfigurationTarget.Global);
         await c.update("defaultStatusMode",     msg.defaultStatusMode,                            vscode.ConfigurationTarget.Global);
         await c.update("defaultStatusIds",      msg.defaultStatusIds ?? [],                       vscode.ConfigurationTarget.Global);
         await c.update("defaultAssigneeMode",   msg.defaultAssigneeMode,                          vscode.ConfigurationTarget.Global);
         await c.update("defaultAssigneeId",     msg.defaultAssigneeId ?? "",                      vscode.ConfigurationTarget.Global);
+        await c.update("defaultAssigneeName",   msg.defaultAssigneeName ?? "",                    vscode.ConfigurationTarget.Global);
         this.panel?.webview.postMessage({ command: "saved" });
         vscode.commands.executeCommand("redmine.refresh");
       }
@@ -345,6 +352,12 @@ function buildHtml(
   <div class="feedback" id="saveFb2"></div>
 </div>
 
+<!-- Feedback footer (always visible) -->
+<div style="margin-top:32px;padding-top:16px;border-top:1px solid var(--vscode-widget-border,#333);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+  <span style="font-size:.78em;color:var(--vscode-descriptionForeground)">Have a suggestion or found a bug?</span>
+  <button class="btn btn-sec btn-sm" onclick="vscode.postMessage({command:'openFeedback'})">📣 Send Feedback</button>
+</div>
+
 <script>
   const vscode = acquireVsCodeApi();
 
@@ -357,15 +370,21 @@ function buildHtml(
   const INIT_AM   = ${JSON.stringify(init.defaultAssigneeMode)};
   const INIT_AID  = ${JSON.stringify(init.defaultAssigneeId)};
 
+  let _membersLoaded = MEMBERS.length > 0;
+
   // Render immediately on load
   renderProjects(PROJECTS);
   renderStatuses(STATUSES);
-  renderMembers(MEMBERS);
+  renderMembers(MEMBERS, INIT_AID);
 
   // ── Tab switching ──────────────────────────────────────────────────────────
   function switchTab(name, btn) {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+    if (name === 'filters') {
+      const projId = val('defaultProject');
+      if (projId && !_membersLoaded) onProjectChange();
+    }
   }
 
   function toggleKey(ev) {
@@ -405,21 +424,24 @@ function buildHtml(
     });
   }
 
-  function renderMembers(list) {
+  function renderMembers(list, selectedId) {
     const sel = document.getElementById('defaultAssigneeId');
-    sel.innerHTML = '<option value="">— Chọn thành viên —</option>';
+    const currentVal = selectedId !== undefined ? selectedId : sel.value;
+    sel.innerHTML = '<option value="">— Select member —</option>';
     if (!list.length) {
       const o = document.createElement('option');
-      o.value = ''; o.textContent = '(Chưa có — chọn project trước)'; o.disabled = true;
+      o.value = ''; o.textContent = '(No members — select a project first)'; o.disabled = true;
       sel.appendChild(o);
+      _membersLoaded = false;
       return;
     }
     list.forEach(m => {
       const o = document.createElement('option');
       o.value = m.id; o.textContent = m.name;
-      if (m.id === INIT_AID) o.selected = true;
+      if (m.id === currentVal) o.selected = true;
       sel.appendChild(o);
     });
+    _membersLoaded = true;
   }
 
   // ── Event handlers ──────────────────────────────────────────────────────────
@@ -435,7 +457,7 @@ function buildHtml(
 
   function onProjectChange() {
     const projId = document.getElementById('defaultProject').value;
-    if (!projId) { renderMembers([]); return; }
+    if (!projId) { renderMembers([], ''); return; }
     vscode.postMessage({ command: 'fetchMembers', projectId: projId });
   }
 
@@ -462,16 +484,34 @@ function buildHtml(
       ? Array.from(document.querySelectorAll('#statusGrid input:checked')).map(c => c.value)
       : [];
     const tf = document.querySelector('input[name="textFormat"]:checked')?.value ?? 'textile';
+
+    const projSel = document.getElementById('defaultProject');
+    const projId   = projSel.value;
+    const projName = projSel.selectedIndex >= 0 ? projSel.options[projSel.selectedIndex].text : '';
+
+    const memberSel = document.getElementById('defaultAssigneeId');
+    const assigneeId   = am === 'custom' ? memberSel.value : '';
+    const assigneeName = (am === 'custom' && memberSel.selectedIndex >= 0)
+      ? memberSel.options[memberSel.selectedIndex].text : '';
+
+    if (am === 'custom' && !assigneeId) {
+      showFb('saveFb2', 'error', 'Please select a member for custom assignee mode. If the list is empty, select a project first.');
+      showFb('saveFb1', 'error', 'Please select a member for custom assignee mode.');
+      return;
+    }
+
     vscode.postMessage({
       command: 'save',
-      baseUrl:            val('baseUrl'),
-      apiKey:             val('apiKey'),
-      defaultProject:     val('defaultProject'),
-      textFormat:         tf,
-      defaultStatusMode:  sm,
-      defaultStatusIds:   ids,
-      defaultAssigneeMode: am,
-      defaultAssigneeId:  am === 'custom' ? val('defaultAssigneeId') : '',
+      baseUrl:              val('baseUrl'),
+      apiKey:               val('apiKey'),
+      defaultProject:       projId,
+      defaultProjectName:   projId ? projName : '',
+      textFormat:           tf,
+      defaultStatusMode:    sm,
+      defaultStatusIds:     ids,
+      defaultAssigneeMode:  am,
+      defaultAssigneeId:    assigneeId,
+      defaultAssigneeName:  assigneeName,
     });
   }
 
@@ -494,8 +534,8 @@ function buildHtml(
     if (msg.command === 'reloadResult') {
       renderProjects(msg.projects);
       renderStatuses(msg.statuses);
-      renderMembers(msg.members);
-      showFb('reloadFb', 'success', '✓ Đã cập nhật từ Redmine.');
+      renderMembers(msg.members, INIT_AID);
+      showFb('reloadFb', 'success', '✓ Updated from Redmine.');
     }
 
     if (msg.command === 'reloadError') {
@@ -503,7 +543,7 @@ function buildHtml(
     }
 
     if (msg.command === 'membersResult') {
-      renderMembers(msg.members);
+      renderMembers(msg.members, undefined);
     }
 
     if (msg.command === 'saved') {

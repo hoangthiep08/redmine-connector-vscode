@@ -62,6 +62,21 @@
           "default": "",
           "description": "User ID to filter by when defaultAssigneeMode is custom"
         },
+        "redmine.defaultAssigneeName": {
+          "type": "string",
+          "default": "",
+          "description": "Display name for the custom default assignee (auto-filled when saving settings)"
+        },
+        "redmine.defaultProjectName": {
+          "type": "string",
+          "default": "",
+          "description": "Display name for the default project (auto-filled when saving settings)"
+        },
+        "redmine.feedbackWebhookUrl": {
+          "type": "string",
+          "default": "",
+          "description": "n8n webhook URL to receive feedback submissions"
+        },
         "redmine.textFormat": {
           "type": "string",
           "default": "textile",
@@ -173,6 +188,24 @@
         "category": "Redmine"
       },
       {
+        "command": "redmine.search",
+        "title": "Search Issues",
+        "icon": "$(search)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.groupBy",
+        "title": "Group By",
+        "icon": "$(list-tree)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.feedback",
+        "title": "Send Feedback",
+        "icon": "$(feedback)",
+        "category": "Redmine"
+      },
+      {
         "command": "redmine.configure",
         "title": "Configure Redmine Connection",
         "icon": "$(settings-gear)",
@@ -184,22 +217,27 @@
         {
           "command": "redmine.refresh",
           "when": "view == redmine.issueList",
-          "group": "navigation"
+          "group": "navigation@1"
         },
         {
-          "command": "redmine.createIssue",
+          "command": "redmine.search",
           "when": "view == redmine.issueList",
-          "group": "navigation"
+          "group": "navigation@2"
         },
         {
           "command": "redmine.filter",
           "when": "view == redmine.issueList",
-          "group": "navigation"
+          "group": "navigation@3"
         },
         {
           "command": "redmine.configure",
           "when": "view == redmine.issueList",
-          "group": "navigation"
+          "group": "navigation@4"
+        },
+        {
+          "command": "redmine.feedback",
+          "when": "view == redmine.issueList",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [

@@ -11,9 +11,10 @@ import {
   Project,
   Member,
 } from "./redmine-client";
-import { IssueProvider, IssueTreeItem } from "./issue-provider";
+import { IssueProvider, IssueTreeItem, GroupByMode } from "./issue-provider";
 import { IssueWebview } from "./issue-webview";
 import { SettingsWebview } from "./settings-webview";
+import { FeedbackWebview } from "./feedback-webview";
 import { pushIssueToAI, copyIssueMarkdown } from "./push-to-ai";
 import { registerChatParticipant } from "./chat-participant";
 
@@ -24,6 +25,8 @@ export function activate(context: vscode.ExtensionContext) {
   const webview = new IssueWebview(context);
   const settingsWebview = new SettingsWebview(context);
 
+  const feedbackWebview = new FeedbackWebview(context);
+
   const treeView = vscode.window.createTreeView("redmine.issueList", {
     treeDataProvider: provider,
     showCollapseAll: false,
@@ -32,7 +35,12 @@ export function activate(context: vscode.ExtensionContext) {
   vscode.workspace.onDidChangeConfiguration((e) => {
     if (e.affectsConfiguration("redmine")) {
       initClient();
-      provider.refresh();
+      const cur = provider.getFilter();
+      if (cur.subject) {
+        provider.setFilter({ ...cur, subject: undefined });
+      } else {
+        provider.refresh();
+      }
     }
   });
 
@@ -231,28 +239,28 @@ export function activate(context: vscode.ExtensionContext) {
 
       // Loop: stay in filter menu until user presses Esc
       while (true) {
+        // Use effective filter (session + config defaults) for display
         const cur = provider.getFilter();
+        const eff = provider.getEffectiveFilter();
 
-        const projectLabel = cur.projectName ? `Project: ${cur.projectName}` : "Project: All";
-        const statusLabel = cur.statusName
-          ? `Status: ${cur.statusName}`
-          : cur.statusId === "*"
+        const projectLabel = eff.projectName ? `Project: ${eff.projectName}` : "Project: All";
+        const statusLabel = eff.statusName
+          ? `Status: ${eff.statusName}`
+          : eff.statusId === "*"
           ? "Status: All"
-          : cur.statusId === "closed"
+          : eff.statusId === "closed"
           ? "Status: Closed"
-          : "Status: Open";
-        const assignLabel = cur.assignedToMe
+          : "Status: Open (default)";
+        const assignLabel = eff.assignedToMe
           ? "Assignee: Me ✓"
-          : cur.assignedToName
-          ? `Assignee: ${cur.assignedToName}`
+          : eff.assignedToName
+          ? `Assignee: ${eff.assignedToName}`
+          : eff.assignedToId
+          ? "Assignee: Custom user"
           : "Assignee: Everyone";
         const searchLabel = cur.subject ? `Search: "${cur.subject}"` : "Search: —";
-        const hasFilter =
-          cur.projectId ||
-          (cur.statusId && cur.statusId !== "open") ||
-          cur.assignedToMe ||
-          cur.assignedToId ||
-          cur.subject;
+        // "Clear" only appears when there are session-level overrides
+        const hasFilter = provider.hasSessionFilter();
 
         const options = [
           { label: `$(folder) ${projectLabel}`, id: "project" },
@@ -287,7 +295,7 @@ export function activate(context: vscode.ExtensionContext) {
             placeHolder: cur.projectName ? `Current: ${cur.projectName}` : "All projects",
           });
           if (p) {
-            provider.setFilter({ ...cur, projectId: p.id || undefined, projectName: p.name || undefined });
+            provider.setFilter({ ...cur, projectId: p.id || undefined, projectName: p.name || undefined, subject: undefined });
           }
           continue; // back to main menu
         }
@@ -305,13 +313,13 @@ export function activate(context: vscode.ExtensionContext) {
             placeHolder: statusLabel,
           });
           if (s && s.id) {
-            provider.setFilter({ ...cur, statusId: s.id, statusName: s.name || undefined });
+            provider.setFilter({ ...cur, statusId: s.id, statusName: s.name || undefined, subject: undefined });
           }
           continue;
         }
 
         if (picked.id === "assign") {
-          const projectId = cur.projectId;
+          const projectId = eff.projectId; // use effective (session + config default)
           const memberPicks: { label: string; description?: string; id: string; name: string }[] = [
             { label: "$(globe) Everyone", id: "all", name: "" },
             { label: "$(person) Assigned to me", id: "me", name: "me" },
@@ -325,10 +333,14 @@ export function activate(context: vscode.ExtensionContext) {
                 for (const m of members) {
                   memberPicks.push({ label: m.name, description: m.roles.join(", "), id: String(m.id), name: m.name });
                 }
+              } else {
+                memberPicks.push({ label: "$(info) No members found for this project", id: "_hint", name: "_hint" });
               }
-            } catch { /* skip */ }
+            } catch (err) {
+              memberPicks.push({ label: `$(warning) Failed to load members: ${err instanceof Error ? err.message : String(err)}`, id: "_hint", name: "_hint" });
+            }
           } else {
-            memberPicks.push({ label: "$(info) Select a project first to filter by user", id: "_hint", name: "_hint" });
+            memberPicks.push({ label: "$(info) Set a default project in Settings to filter by user", id: "_hint", name: "_hint" });
           }
 
           const a = await vscode.window.showQuickPick(memberPicks, {
@@ -337,11 +349,11 @@ export function activate(context: vscode.ExtensionContext) {
           });
           if (a && a.id !== "_sep" && a.id !== "_hint") {
             if (a.id === "all") {
-              provider.setFilter({ ...cur, assignedToMe: false, assignedToId: undefined, assignedToName: undefined });
+              provider.setFilter({ ...cur, assignedToMe: false, assignedToId: undefined, assignedToName: undefined, subject: undefined });
             } else if (a.id === "me") {
-              provider.setFilter({ ...cur, assignedToMe: true, assignedToId: undefined, assignedToName: undefined });
+              provider.setFilter({ ...cur, assignedToMe: true, assignedToId: undefined, assignedToName: undefined, subject: undefined });
             } else {
-              provider.setFilter({ ...cur, assignedToMe: false, assignedToId: a.id, assignedToName: a.name });
+              provider.setFilter({ ...cur, assignedToMe: false, assignedToId: a.id, assignedToName: a.name, subject: undefined });
             }
           }
           continue;
@@ -363,6 +375,33 @@ export function activate(context: vscode.ExtensionContext) {
     }],
 
     ["redmine.clearFilters", () => provider.clearFilter()],
+    ["redmine.feedback", () => feedbackWebview.show()],
+
+    ["redmine.groupBy", async () => {
+      const current = provider.getGroupBy();
+      const options: { label: string; description?: string; mode: GroupByMode }[] = [
+        { label: "$(list-tree) Group by Project", mode: "project", description: current === "project" ? "✓ active" : undefined },
+        { label: "$(circle-filled) Group by Status",  mode: "status",  description: current === "status"  ? "✓ active" : undefined },
+        { label: "$(list-flat) No grouping (flat)",   mode: "none",    description: current === "none"    ? "✓ active" : undefined },
+      ];
+      const pick = await vscode.window.showQuickPick(options, {
+        title: "Group Issues By",
+        placeHolder: "Select grouping mode",
+      });
+      if (pick) provider.setGroupBy(pick.mode);
+    }],
+
+    ["redmine.search", async () => {
+      const cur = provider.getFilter();
+      const keyword = await vscode.window.showInputBox({
+        title: "Search Issues",
+        value: cur.subject ?? "",
+        placeHolder: "Type a keyword to search in issue subjects…",
+        prompt: "Leave empty to clear search filter",
+      });
+      if (keyword === undefined) return; // Esc
+      provider.setFilter({ ...cur, subject: keyword.trim() || undefined });
+    }],
   ];
 
   for (const [cmd, handler] of cmds) {
