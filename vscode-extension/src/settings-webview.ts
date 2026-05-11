@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import axios from "axios";
-import { listProjects, listStatuses, listProjectMembers, configureClient } from "./redmine-client";
+import { listProjects, listStatuses, listProjectMembers, listTrackers, configureClient } from "./redmine-client";
 
 export class SettingsWebview {
   private panel: vscode.WebviewPanel | null = null;
@@ -24,19 +24,22 @@ export class SettingsWebview {
       defaultStatusIds:     cfg.get<string[]>("defaultStatusIds") ?? [],
       defaultAssigneeMode:  cfg.get<string>("defaultAssigneeMode") ?? "all",
       defaultAssigneeId:    cfg.get<string>("defaultAssigneeId") ?? "",
+      defaultTrackerId:     cfg.get<string>("defaultTrackerId") ?? "",
     };
 
     // Pre-fetch lookup data before building the webview
     let projects: { id: string; name: string }[] = [];
     let statuses: { id: string; name: string; is_closed: boolean }[] = [];
     let members:  { id: string; name: string }[] = [];
+    let trackers: { id: string; name: string }[] = [];
 
     if (baseUrl && apiKey) {
       try {
         configureClient(baseUrl, apiKey);
-        [projects, statuses] = await Promise.all([
+        [projects, statuses, trackers] = await Promise.all([
           listProjects().then((ps) => ps.map((p) => ({ id: p.identifier, name: p.name }))).catch(() => []),
           listStatuses().then((ss) => ss.map((s) => ({ id: String(s.id), name: s.name, is_closed: s.is_closed }))).catch(() => []),
+          listTrackers().then((ts) => ts.map((t) => ({ id: String(t.id), name: t.name }))).catch(() => []),
         ]);
         if (init.defaultProject) {
           members = await listProjectMembers(init.defaultProject)
@@ -57,7 +60,7 @@ export class SettingsWebview {
       vscode.Uri.joinPath(this.context.extensionUri, "resources", "redmine.png")
     );
 
-    this.panel.webview.html = buildHtml(init, projects, statuses, members, logoUri.toString());
+    this.panel.webview.html = buildHtml(init, projects, statuses, members, trackers, logoUri.toString());
 
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       if (msg.command === "openFeedback") {
@@ -79,6 +82,8 @@ export class SettingsWebview {
         await c.update("defaultAssigneeMode",   msg.defaultAssigneeMode,                          vscode.ConfigurationTarget.Global);
         await c.update("defaultAssigneeId",     msg.defaultAssigneeId ?? "",                      vscode.ConfigurationTarget.Global);
         await c.update("defaultAssigneeName",   msg.defaultAssigneeName ?? "",                    vscode.ConfigurationTarget.Global);
+        await c.update("defaultTrackerId",      msg.defaultTrackerId ?? "",                        vscode.ConfigurationTarget.Global);
+        await c.update("defaultTrackerName",    msg.defaultTrackerName ?? "",                      vscode.ConfigurationTarget.Global);
         this.panel?.webview.postMessage({ command: "saved" });
         vscode.commands.executeCommand("redmine.refresh");
       }
@@ -110,9 +115,10 @@ export class SettingsWebview {
           const url = (msg.baseUrl as string).trim().replace(/\/$/, "");
           const key = (msg.apiKey as string).trim();
           configureClient(url, key);
-          const [ps, ss] = await Promise.all([
+          const [ps, ss, ts] = await Promise.all([
             listProjects().catch(() => []),
             listStatuses().catch(() => []),
+            listTrackers().catch(() => []),
           ]);
           const projId = (msg.selectedProject as string) ?? "";
           let ms: { id: string; name: string }[] = [];
@@ -125,6 +131,7 @@ export class SettingsWebview {
             command: "reloadResult",
             projects: ps.map((p) => ({ id: p.identifier, name: p.name })),
             statuses: ss.map((s) => ({ id: String(s.id), name: s.name, is_closed: s.is_closed })),
+            trackers: ts.map((t) => ({ id: String(t.id), name: t.name })),
             members: ms,
           });
         } catch (err) {
@@ -165,10 +172,12 @@ function buildHtml(
     showOnlyAssignedToMe: boolean; textFormat: string;
     defaultStatusMode: string; defaultStatusIds: string[];
     defaultAssigneeMode: string; defaultAssigneeId: string;
+    defaultTrackerId: string;
   },
   projects: { id: string; name: string }[],
   statuses: { id: string; name: string; is_closed: boolean }[],
   members:  { id: string; name: string }[],
+  trackers: { id: string; name: string }[],
   logoSrc: string,
 ): string {
   return `<!DOCTYPE html>
@@ -251,7 +260,7 @@ function buildHtml(
   <img src="${e(logoSrc)}" alt="Redmine">
   <div class="header-text">
     <div class="logo">Redmine Connector</div>
-    <div class="subtitle">Cấu hình kết nối và điều kiện lọc mặc định</div>
+    <div class="subtitle">Connection settings and default filter preferences</div>
   </div>
 </div>
 
@@ -267,12 +276,12 @@ function buildHtml(
     <div class="field">
       <label class="fl" for="baseUrl">Redmine URL</label>
       <input type="text" id="baseUrl" value="${e(init.baseUrl)}" placeholder="https://redmine.company.com">
-      <div class="hint">URL của Redmine server (không có / ở cuối)</div>
+      <div class="hint">Redmine server URL (no trailing slash)</div>
     </div>
     <div class="field">
       <label class="fl">API Key <button class="show-key" onclick="toggleKey(event)">show</button></label>
       <input type="password" id="apiKey" value="${e(init.apiKey)}" placeholder="Paste your API key here">
-      <div class="hint">Redmine → tên user → <strong>My Account</strong> → <strong>API access key</strong> → Show</div>
+      <div class="hint">Redmine → your username → <strong>My Account</strong> → <strong>API access key</strong> → Show</div>
     </div>
     <div class="btn-row">
       <button class="btn btn-sec btn-sm" onclick="testConn()">⚡ Test Connection</button>
@@ -285,7 +294,7 @@ function buildHtml(
   <div class="section">
     <div class="section-title">Text Format</div>
     <div class="radio-group">
-      <div class="radio-row"><input type="radio" name="textFormat" id="tf-textile"  value="textile"  ${init.textFormat==="textile"?"checked":""}><label for="tf-textile">Textile <span style="color:var(--vscode-descriptionForeground);font-size:.85em">(Redmine mặc định)</span></label></div>
+      <div class="radio-row"><input type="radio" name="textFormat" id="tf-textile"  value="textile"  ${init.textFormat==="textile"?"checked":""}><label for="tf-textile">Textile <span style="color:var(--vscode-descriptionForeground);font-size:.85em">(Redmine default)</span></label></div>
       <div class="radio-row"><input type="radio" name="textFormat" id="tf-markdown" value="markdown" ${init.textFormat==="markdown"?"checked":""}><label for="tf-markdown">Markdown</label></div>
       <div class="radio-row"><input type="radio" name="textFormat" id="tf-plain"    value="plain"    ${init.textFormat==="plain"?"checked":""}><label for="tf-plain">Plain text</label></div>
     </div>
@@ -306,7 +315,7 @@ function buildHtml(
     <select id="defaultProject" onchange="onProjectChange()">
       <option value="">All Projects</option>
     </select>
-    <div class="hint" style="margin-top:6px">Project hiển thị mặc định. Có thể override bằng filter trong sidebar.</div>
+    <div class="hint" style="margin-top:6px">Default project shown on startup. Can be overridden by the sidebar filter.</div>
   </div>
 
   <hr class="divider">
@@ -314,14 +323,14 @@ function buildHtml(
   <div class="section">
     <div class="section-title">Default Status Filter</div>
     <div class="radio-group">
-      <div class="radio-row"><input type="radio" name="sm" id="sm-open"   value="open"   ${init.defaultStatusMode==="open"?"checked":""}   onchange="onSmChange()"><label for="sm-open">Open issues <span style="color:var(--vscode-descriptionForeground);font-size:.85em">(mặc định)</span></label></div>
+      <div class="radio-row"><input type="radio" name="sm" id="sm-open"   value="open"   ${init.defaultStatusMode==="open"?"checked":""}   onchange="onSmChange()"><label for="sm-open">Open issues <span style="color:var(--vscode-descriptionForeground);font-size:.85em">(default)</span></label></div>
       <div class="radio-row"><input type="radio" name="sm" id="sm-closed" value="closed" ${init.defaultStatusMode==="closed"?"checked":""} onchange="onSmChange()"><label for="sm-closed">Closed issues</label></div>
       <div class="radio-row"><input type="radio" name="sm" id="sm-all"    value="*"      ${init.defaultStatusMode==="*"?"checked":""}      onchange="onSmChange()"><label for="sm-all">All statuses</label></div>
-      <div class="radio-row"><input type="radio" name="sm" id="sm-custom" value="custom" ${init.defaultStatusMode==="custom"?"checked":""} onchange="onSmChange()"><label for="sm-custom">Custom — chọn cụ thể bên dưới</label></div>
+      <div class="radio-row"><input type="radio" name="sm" id="sm-custom" value="custom" ${init.defaultStatusMode==="custom"?"checked":""} onchange="onSmChange()"><label for="sm-custom">Custom — select specific statuses below</label></div>
     </div>
 
     <div class="status-list ${init.defaultStatusMode==="custom"?"show":""}" id="statusList">
-      <div class="status-hint">Chọn một hoặc nhiều status muốn hiển thị mặc định:</div>
+      <div class="status-hint">Select one or more statuses to show by default:</div>
       <div class="status-grid" id="statusGrid"></div>
     </div>
   </div>
@@ -331,23 +340,33 @@ function buildHtml(
   <div class="section">
     <div class="section-title">Default Assignee</div>
     <div class="radio-group">
-      <div class="radio-row"><input type="radio" name="am" id="am-all"    value="all"    ${init.defaultAssigneeMode==="all"?"checked":""}    onchange="onAmChange()"><label for="am-all">All — không lọc theo người</label></div>
+      <div class="radio-row"><input type="radio" name="am" id="am-all"    value="all"    ${init.defaultAssigneeMode==="all"?"checked":""}    onchange="onAmChange()"><label for="am-all">All — no assignee filter</label></div>
       <div class="radio-row"><input type="radio" name="am" id="am-me"     value="me"     ${init.defaultAssigneeMode==="me"?"checked":""}     onchange="onAmChange()"><label for="am-me">Assigned to me</label></div>
-      <div class="radio-row"><input type="radio" name="am" id="am-custom" value="custom" ${init.defaultAssigneeMode==="custom"?"checked":""} onchange="onAmChange()"><label for="am-custom">Cụ thể — chọn người bên dưới</label></div>
+      <div class="radio-row"><input type="radio" name="am" id="am-custom" value="custom" ${init.defaultAssigneeMode==="custom"?"checked":""} onchange="onAmChange()"><label for="am-custom">Custom — select a specific member below</label></div>
     </div>
 
     <div class="member-list ${init.defaultAssigneeMode==="custom"?"show":""}" id="memberList">
-      <div class="member-hint">Chọn thành viên (cần chọn project mặc định trước):</div>
+      <div class="member-hint">Select a member (requires a default project to be set):</div>
       <select id="defaultAssigneeId" style="width:100%">
-        <option value="">— Chọn thành viên —</option>
+        <option value="">— Select member —</option>
       </select>
     </div>
   </div>
 
   <hr class="divider">
+
+  <div class="section">
+    <div class="section-title">Default Tracker</div>
+    <select id="defaultTrackerId">
+      <option value="">All Trackers</option>
+    </select>
+    <div class="hint" style="margin-top:6px">Filter issues by tracker type (e.g. Bug, Task, Feature). Can be overridden by the sidebar filter.</div>
+  </div>
+
+  <hr class="divider">
   <div class="btn-row">
     <button class="btn" onclick="save()">💾 Save Settings</button>
-    <button class="btn btn-sec btn-sm" onclick="reloadAll()">🔄 Reload từ Redmine</button>
+    <button class="btn btn-sec btn-sm" onclick="reloadAll()">🔄 Reload from Redmine</button>
   </div>
   <div class="feedback" id="saveFb2"></div>
 </div>
@@ -365,10 +384,12 @@ function buildHtml(
   const PROJECTS  = ${JSON.stringify(projects)};
   const STATUSES  = ${JSON.stringify(statuses)};
   const MEMBERS   = ${JSON.stringify(members)};
+  const TRACKERS  = ${JSON.stringify(trackers)};
   const INIT_IDS  = ${JSON.stringify(init.defaultStatusIds)};
   const INIT_PROJ = ${JSON.stringify(init.defaultProject)};
   const INIT_AM   = ${JSON.stringify(init.defaultAssigneeMode)};
   const INIT_AID  = ${JSON.stringify(init.defaultAssigneeId)};
+  const INIT_TID  = ${JSON.stringify(init.defaultTrackerId)};
 
   let _membersLoaded = MEMBERS.length > 0;
 
@@ -376,6 +397,7 @@ function buildHtml(
   renderProjects(PROJECTS);
   renderStatuses(STATUSES);
   renderMembers(MEMBERS, INIT_AID);
+  renderTrackers(TRACKERS);
 
   // ── Tab switching ──────────────────────────────────────────────────────────
   function switchTab(name, btn) {
@@ -408,7 +430,7 @@ function buildHtml(
   function renderStatuses(list) {
     const grid = document.getElementById('statusGrid');
     if (!list.length) {
-      grid.innerHTML = '<span class="empty-text">Chưa load được — nhấn "Reload từ Redmine"</span>';
+      grid.innerHTML = '<span class="empty-text">Not loaded yet — click "Reload from Redmine"</span>';
       return;
     }
     grid.innerHTML = '';
@@ -421,6 +443,18 @@ function buildHtml(
       lbl.textContent = s.name + (s.is_closed ? ' (closed)' : '');
       lbl.style.cssText = 'font-size:.87em;cursor:pointer';
       wrap.appendChild(cb); wrap.appendChild(lbl); grid.appendChild(wrap);
+    });
+  }
+
+  function renderTrackers(list) {
+    const sel = document.getElementById('defaultTrackerId');
+    const currentVal = sel.value || INIT_TID;
+    sel.innerHTML = '<option value="">All Trackers</option>';
+    list.forEach(t => {
+      const o = document.createElement('option');
+      o.value = t.id; o.textContent = t.name;
+      if (t.id === currentVal) o.selected = true;
+      sel.appendChild(o);
     });
   }
 
@@ -468,7 +502,7 @@ function buildHtml(
   }
 
   function reloadAll() {
-    showFb('reloadFb', 'info', 'Loading từ Redmine…');
+    showFb('reloadFb', 'info', 'Loading from Redmine…');
     vscode.postMessage({
       command: 'reloadOptions',
       baseUrl: val('baseUrl'),
@@ -500,6 +534,11 @@ function buildHtml(
       return;
     }
 
+    const trackerSel = document.getElementById('defaultTrackerId');
+    const trackerId   = trackerSel.value;
+    const trackerName = (trackerSel.selectedIndex >= 0 && trackerId)
+      ? trackerSel.options[trackerSel.selectedIndex].text : '';
+
     vscode.postMessage({
       command: 'save',
       baseUrl:              val('baseUrl'),
@@ -512,6 +551,8 @@ function buildHtml(
       defaultAssigneeMode:  am,
       defaultAssigneeId:    assigneeId,
       defaultAssigneeName:  assigneeName,
+      defaultTrackerId:     trackerId,
+      defaultTrackerName:   trackerName,
     });
   }
 
@@ -535,6 +576,7 @@ function buildHtml(
       renderProjects(msg.projects);
       renderStatuses(msg.statuses);
       renderMembers(msg.members, INIT_AID);
+      if (msg.trackers) renderTrackers(msg.trackers);
       showFb('reloadFb', 'success', '✓ Updated from Redmine.');
     }
 
@@ -548,7 +590,7 @@ function buildHtml(
 
     if (msg.command === 'saved') {
       ['saveFb1','saveFb2'].forEach(id => {
-        showFb(id, 'success', '✓ Đã lưu! Sidebar sẽ tự refresh.');
+        showFb(id, 'success', '✓ Saved! The sidebar will refresh automatically.');
         setTimeout(() => { const el = document.getElementById(id); if (el) el.style.display = 'none'; }, 3000);
       });
     }

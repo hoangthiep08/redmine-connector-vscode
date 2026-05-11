@@ -2,8 +2,7 @@ import * as vscode from "vscode";
 import axios from "axios";
 import { getCurrentUser } from "./redmine-client";
 
-const FEEDBACK_WEBHOOK_URL = "https://hoangthiep08.top/webhook-test/redmine-feedback";
-// Production: https://hoangthiep08.top/webhook/redmine-feedback
+const FEEDBACK_WEBHOOK_URL = "https://hoangthiep08.top/webhook/redmine-feedback";
 
 export class FeedbackWebview {
   private panel: vscode.WebviewPanel | null = null;

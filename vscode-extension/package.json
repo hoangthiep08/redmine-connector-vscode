@@ -2,8 +2,8 @@
   "name": "redmine-connector",
   "displayName": "Redmine Connector",
   "description": "Connect your company's Redmine to VS Code, Cursor, Windsurf — manage issues and push to AI chat",
-  "publisher": "company-internal",
-  "version": "1.0.1",
+  "publisher": "hoangthiep",
+  "version": "1.0.2",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -15,6 +15,12 @@
   ],
   "main": "./dist/extension.js",
   "icon": "resources/redmine.png",
+  "license": "MIT",
+  "readme": "README.md",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hoangthiep08/redmine-connector"
+  },
   "contributes": {
     "configuration": {
       "title": "Redmine Connector",
@@ -71,6 +77,16 @@
           "type": "string",
           "default": "",
           "description": "Display name for the default project (auto-filled when saving settings)"
+        },
+        "redmine.defaultTrackerId": {
+          "type": "string",
+          "default": "",
+          "description": "Default tracker ID to filter issues (e.g. Bug, Task)"
+        },
+        "redmine.defaultTrackerName": {
+          "type": "string",
+          "default": "",
+          "description": "Display name for the default tracker (auto-filled when saving settings)"
         },
         "redmine.feedbackWebhookUrl": {
           "type": "string",
@@ -203,6 +219,11 @@
         "command": "redmine.feedback",
         "title": "Send Feedback",
         "icon": "$(feedback)",
+        "category": "Redmine"
+      },
+      {
+        "command": "redmine.loadMore",
+        "title": "Load More Issues",
         "category": "Redmine"
       },
       {

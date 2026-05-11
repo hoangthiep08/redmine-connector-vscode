@@ -5,11 +5,13 @@ import {
   listProjects,
   listStatuses,
   listProjectMembers,
+  listTrackers,
   updateIssue,
   createIssue,
   IssueStatus,
   Project,
   Member,
+  Tracker,
 } from "./redmine-client";
 import { IssueProvider, IssueTreeItem, GroupByMode } from "./issue-provider";
 import { IssueWebview } from "./issue-webview";
@@ -225,11 +227,12 @@ export function activate(context: vscode.ExtensionContext) {
     ["redmine.filter", async (...args: unknown[]) => {
       const focusOn = args[0] as string | undefined;
 
-      // Load projects & statuses once before the loop
+      // Load projects, statuses & trackers once before the loop
       let projects: Project[] = [];
       let statuses: IssueStatus[] = [];
+      let trackers: Tracker[] = [];
       try {
-        [projects, statuses] = await Promise.all([listProjects(), listStatuses()]);
+        [projects, statuses, trackers] = await Promise.all([listProjects(), listStatuses(), listTrackers()]);
       } catch (err) {
         vscode.window.showErrorMessage(`Failed to load filter options: ${err}`);
         return;
@@ -258,6 +261,7 @@ export function activate(context: vscode.ExtensionContext) {
           : eff.assignedToId
           ? "Assignee: Custom user"
           : "Assignee: Everyone";
+        const trackerLabel = cur.trackerName ? `Tracker: ${cur.trackerName}` : "Tracker: All";
         const searchLabel = cur.subject ? `Search: "${cur.subject}"` : "Search: —";
         // "Clear" only appears when there are session-level overrides
         const hasFilter = provider.hasSessionFilter();
@@ -266,6 +270,7 @@ export function activate(context: vscode.ExtensionContext) {
           { label: `$(folder) ${projectLabel}`, id: "project" },
           { label: `$(circle-filled) ${statusLabel}`, id: "status" },
           { label: `$(person) ${assignLabel}`, id: "assign" },
+          { label: `$(tag) ${trackerLabel}`, id: "tracker" },
           { label: `$(search) ${searchLabel}`, id: "search" },
           ...(hasFilter ? [{ label: "$(trash) Clear all filters", id: "clear" }] : []),
         ];
@@ -359,6 +364,21 @@ export function activate(context: vscode.ExtensionContext) {
           continue;
         }
 
+        if (picked.id === "tracker") {
+          const trackerPicks = [
+            { label: "All Trackers", id: "", name: "" },
+            ...trackers.map((t) => ({ label: t.name, id: String(t.id), name: t.name })),
+          ];
+          const t = await vscode.window.showQuickPick(trackerPicks, {
+            title: "Filter by Tracker",
+            placeHolder: trackerLabel,
+          });
+          if (t) {
+            provider.setFilter({ ...cur, trackerId: t.id || undefined, trackerName: t.name || undefined, subject: undefined });
+          }
+          continue;
+        }
+
         if (picked.id === "search") {
           const keyword = await vscode.window.showInputBox({
             title: "Search in issue subjects",
@@ -375,6 +395,7 @@ export function activate(context: vscode.ExtensionContext) {
     }],
 
     ["redmine.clearFilters", () => provider.clearFilter()],
+    ["redmine.loadMore", () => provider.loadMore()],
     ["redmine.feedback", () => feedbackWebview.show()],
 
     ["redmine.groupBy", async () => {

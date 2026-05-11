@@ -65,6 +65,11 @@ export interface Priority {
   is_default: boolean;
 }
 
+export interface Tracker {
+  id: number;
+  name: string;
+}
+
 let httpClient: AxiosInstance | null = null;
 let currentBaseUrl = "";
 let currentApiKey = "";
@@ -89,10 +94,16 @@ function getClient(): AxiosInstance {
   return httpClient;
 }
 
+export async function listTrackers(): Promise<Tracker[]> {
+  const res = await getClient().get("/trackers.json");
+  return res.data.trackers;
+}
+
 export async function listIssues(params: {
   projectId?: string;
   statusId?: string;
   assignedToId?: string;
+  trackerId?: string;
   limit?: number;
   offset?: number;
   subject?: string;
@@ -104,6 +115,7 @@ export async function listIssues(params: {
   if (params.projectId) query["project_id"] = params.projectId;
   if (params.statusId) query["status_id"] = params.statusId;
   if (params.assignedToId) query["assigned_to_id"] = params.assignedToId;
+  if (params.trackerId) query["tracker_id"] = params.trackerId;
   if (params.subject) query["subject"] = `~${params.subject}`;
 
   const res = await getClient().get("/issues.json", { params: query });

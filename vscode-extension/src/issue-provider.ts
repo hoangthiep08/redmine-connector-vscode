@@ -9,6 +9,8 @@ export interface IssueFilter {
   assignedToMe?: boolean;
   assignedToId?: string;
   assignedToName?: string;
+  trackerId?: string;
+  trackerName?: string;
   subject?: string;
 }
 
@@ -117,15 +119,27 @@ class ErrorItem extends vscode.TreeItem {
   }
 }
 
+class LoadMoreItem extends vscode.TreeItem {
+  constructor(loaded: number) {
+    super(`Load more issues (showing ${loaded})`, vscode.TreeItemCollapsibleState.None);
+    this.iconPath = new vscode.ThemeIcon("chevron-down");
+    this.command = { command: "redmine.loadMore", title: "Load More" };
+  }
+}
+
 export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined | null>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   private issues: Issue[] = [];
   private loading = false;
+  private loadingMore = false;
   private error: string | null = null;
   private filter: IssueFilter = {};
   private groupBy: GroupByMode = "project";
+  private offset = 0;
+  private hasMore = false;
+  private readonly PAGE_SIZE = 20;
 
   setGroupBy(mode: GroupByMode) {
     this.groupBy = mode;
@@ -138,6 +152,8 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
   setFilter(filter: IssueFilter) {
     this.filter = filter;
+    this.offset = 0;
+    this.issues = [];
     this.load();
   }
 
@@ -186,27 +202,51 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       }
     }
 
+    // Tracker: session → config
+    if (!eff.trackerId) {
+      const tid = config.get<string>("defaultTrackerId") ?? "";
+      if (tid) {
+        eff.trackerId = tid;
+        eff.trackerName = config.get<string>("defaultTrackerName") || undefined;
+      }
+    }
+
     return eff;
   }
 
   /** True when there are session-level overrides (not just config defaults). */
   hasSessionFilter(): boolean {
     const f = this.filter;
-    return !!(f.projectId || f.statusId || f.assignedToMe || f.assignedToId || f.subject);
+    return !!(f.projectId || f.statusId || f.assignedToMe || f.assignedToId || f.trackerId || f.subject);
   }
 
   clearFilter() {
     this.filter = {};
+    this.offset = 0;
+    this.issues = [];
     this.load();
   }
 
   refresh() {
+    this.offset = 0;
+    this.issues = [];
     this.load();
   }
 
-  private async load() {
-    this.loading = true;
-    this.error = null;
+  async loadMore() {
+    if (this.loadingMore || !this.hasMore) return;
+    this.loadingMore = true;
+    this._onDidChangeTreeData.fire(null);
+    await this.load(true);
+  }
+
+  private async load(append = false) {
+    if (append) {
+      this.loadingMore = true;
+    } else {
+      this.loading = true;
+      this.error = null;
+    }
     this._onDidChangeTreeData.fire(null);
 
     try {
@@ -253,27 +293,43 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         try {
           const issue = await getIssue(parseInt(idMatch[1], 10));
           this.issues = [issue];
+          this.hasMore = false;
         } catch {
           this.issues = [];
+          this.hasMore = false;
         }
       } else {
+        const defaultTrackerId = config.get<string>("defaultTrackerId") ?? "";
+        const trackerId = this.filter.trackerId || defaultTrackerId || undefined;
+
         const result = await listIssues({
           projectId: this.filter.projectId || defaultProject || undefined,
           statusId,
           assignedToId,
+          trackerId,
           subject: this.filter.subject,
-          limit: 200,
+          limit: this.PAGE_SIZE,
+          offset: append ? this.offset : 0,
         });
 
-        // Client-side filter for custom multi-status
-        this.issues = customStatusIds.length
+        const fetched = customStatusIds.length
           ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
           : result.issues;
+
+        if (append) {
+          this.issues = [...this.issues, ...fetched];
+        } else {
+          this.issues = fetched;
+        }
+
+        this.offset = this.issues.length;
+        this.hasMore = result.total_count > this.issues.length;
       }
     } catch (err) {
-      this.error = err instanceof Error ? err.message : String(err);
+      if (!append) this.error = err instanceof Error ? err.message : String(err);
     } finally {
       this.loading = false;
+      this.loadingMore = false;
       vscode.commands.executeCommand("setContext", "redmine.hasActiveFilter", this.hasSessionFilter());
       this._onDidChangeTreeData.fire(null);
     }
@@ -299,6 +355,12 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
     // Root level
     if (this.loading) return [new LoadingItem()];
+    if (this.loadingMore) {
+      const items: vscode.TreeItem[] = [];
+      items.push(...this.issues.map((i) => new IssueTreeItem(i)));
+      items.push(new LoadingItem());
+      return items;
+    }
 
     if (this.error) {
       const configItem = new vscode.TreeItem("Click to configure Redmine");
@@ -344,6 +406,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
     // Flat (groupBy === "none" or single group)
     items.push(...this.issues.map((i) => new IssueTreeItem(i)));
+    if (this.hasMore) items.push(new LoadMoreItem(this.issues.length));
     return items;
   }
 
@@ -357,6 +420,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     if (eff.assignedToMe)        parts.push("👤 Assigned to me");
     else if (eff.assignedToName) parts.push(`👤 ${eff.assignedToName}`);
     else if (eff.assignedToId)   parts.push("👤 Custom user");
+    if (eff.trackerName) parts.push(`🏷 ${eff.trackerName}`);
     if (eff.subject) parts.push(`🔍 "${eff.subject}"`);
     return parts.join("  ");
   }
