@@ -25,6 +25,9 @@ export class SettingsWebview {
       defaultAssigneeMode:  cfg.get<string>("defaultAssigneeMode") ?? "all",
       defaultAssigneeId:    cfg.get<string>("defaultAssigneeId") ?? "",
       defaultTrackerId:     cfg.get<string>("defaultTrackerId") ?? "",
+      bugFieldTypeBugId:    cfg.get<string>("bugFieldTypeBugId") ?? "",
+      bugFieldFoundInId:    cfg.get<string>("bugFieldFoundInId") ?? "",
+      bugFieldRootCauseId:  cfg.get<string>("bugFieldRootCauseId") ?? "",
     };
 
     // Pre-fetch lookup data before building the webview
@@ -84,6 +87,9 @@ export class SettingsWebview {
         await c.update("defaultAssigneeName",   msg.defaultAssigneeName ?? "",                    vscode.ConfigurationTarget.Global);
         await c.update("defaultTrackerId",      msg.defaultTrackerId ?? "",                        vscode.ConfigurationTarget.Global);
         await c.update("defaultTrackerName",    msg.defaultTrackerName ?? "",                      vscode.ConfigurationTarget.Global);
+        await c.update("bugFieldTypeBugId",     (msg.bugFieldTypeBugId as string ?? "").trim(),    vscode.ConfigurationTarget.Global);
+        await c.update("bugFieldFoundInId",     (msg.bugFieldFoundInId as string ?? "").trim(),    vscode.ConfigurationTarget.Global);
+        await c.update("bugFieldRootCauseId",   (msg.bugFieldRootCauseId as string ?? "").trim(),  vscode.ConfigurationTarget.Global);
         this.panel?.webview.postMessage({ command: "saved" });
         vscode.commands.executeCommand("redmine.refresh");
       }
@@ -173,6 +179,7 @@ function buildHtml(
     defaultStatusMode: string; defaultStatusIds: string[];
     defaultAssigneeMode: string; defaultAssigneeId: string;
     defaultTrackerId: string;
+    bugFieldTypeBugId: string; bugFieldFoundInId: string; bugFieldRootCauseId: string;
   },
   projects: { id: string; name: string }[],
   statuses: { id: string; name: string; is_closed: boolean }[],
@@ -361,6 +368,27 @@ function buildHtml(
       <option value="">All Trackers</option>
     </select>
     <div class="hint" style="margin-top:6px">Filter issues by tracker type (e.g. Bug, Task, Feature). Can be overridden by the sidebar filter.</div>
+  </div>
+
+  <hr class="divider">
+
+  <div class="section">
+    <div class="section-title">Bug Tracker — Custom Field IDs</div>
+    <div class="hint" style="margin-bottom:10px">Enter the numeric IDs for required Bug fields. Find them in Redmine → Administration → Custom Fields (check the URL or ID column). If you leave these empty, the extension infers IDs from issues already loaded in the sidebar or from the first Bug returned by Redmine (no admin API).</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+      <div>
+        <label class="field-label" style="display:block;margin-bottom:4px;font-size:.84em;font-weight:600">Type Bug ID</label>
+        <input type="text" id="bugFieldTypeBugId" value="${e(init.bugFieldTypeBugId)}" placeholder="e.g. 5" style="width:100%">
+      </div>
+      <div>
+        <label class="field-label" style="display:block;margin-bottom:4px;font-size:.84em;font-weight:600">Found In ID</label>
+        <input type="text" id="bugFieldFoundInId" value="${e(init.bugFieldFoundInId)}" placeholder="e.g. 6" style="width:100%">
+      </div>
+      <div>
+        <label class="field-label" style="display:block;margin-bottom:4px;font-size:.84em;font-weight:600">Root Cause ID</label>
+        <input type="text" id="bugFieldRootCauseId" value="${e(init.bugFieldRootCauseId)}" placeholder="e.g. 7" style="width:100%">
+      </div>
+    </div>
   </div>
 
   <hr class="divider">
@@ -553,6 +581,9 @@ function buildHtml(
       defaultAssigneeName:  assigneeName,
       defaultTrackerId:     trackerId,
       defaultTrackerName:   trackerName,
+      bugFieldTypeBugId:    val('bugFieldTypeBugId'),
+      bugFieldFoundInId:    val('bugFieldFoundInId'),
+      bugFieldRootCauseId:  val('bugFieldRootCauseId'),
     });
   }
 

@@ -3,7 +3,7 @@
   "displayName": "Redmine Connector",
   "description": "Connect your company's Redmine to VS Code, Cursor, Windsurf — manage issues and push to AI chat",
   "publisher": "hoangthiep",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -48,19 +48,30 @@
         "redmine.defaultStatusMode": {
           "type": "string",
           "default": "open",
-          "enum": ["open", "closed", "*", "custom"],
+          "enum": [
+            "open",
+            "closed",
+            "*",
+            "custom"
+          ],
           "description": "Default status filter mode"
         },
         "redmine.defaultStatusIds": {
           "type": "array",
           "default": [],
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Specific status IDs to show when defaultStatusMode is custom"
         },
         "redmine.defaultAssigneeMode": {
           "type": "string",
           "default": "all",
-          "enum": ["all", "me", "custom"],
+          "enum": [
+            "all",
+            "me",
+            "custom"
+          ],
           "description": "Default assignee filter: all / me / custom user"
         },
         "redmine.defaultAssigneeId": {
@@ -87,6 +98,21 @@
           "type": "string",
           "default": "",
           "description": "Display name for the default tracker (auto-filled when saving settings)"
+        },
+        "redmine.bugFieldTypeBugId": {
+          "type": "string",
+          "default": "",
+          "description": "Custom field ID for 'Type Bug' (find in Redmine → Administration → Custom Fields)"
+        },
+        "redmine.bugFieldFoundInId": {
+          "type": "string",
+          "default": "",
+          "description": "Custom field ID for 'Found in' (find in Redmine → Administration → Custom Fields)"
+        },
+        "redmine.bugFieldRootCauseId": {
+          "type": "string",
+          "default": "",
+          "description": "Custom field ID for 'Root Cause' (find in Redmine → Administration → Custom Fields)"
         },
         "redmine.feedbackWebhookUrl": {
           "type": "string",
@@ -231,9 +257,28 @@
         "title": "Configure Redmine Connection",
         "icon": "$(settings-gear)",
         "category": "Redmine"
+      },
+      {
+        "command": "redmine.openTestCase",
+        "title": "Redmine: View Test Case",
+        "icon": "$(list-ordered)"
       }
     ],
     "menus": {
+      "explorer/context": [
+        {
+          "command": "redmine.openTestCase",
+          "when": "resourceExtname == .md",
+          "group": "1_modification"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "redmine.openTestCase",
+          "when": "resourceExtname == .md",
+          "group": "1_modification"
+        }
+      ],
       "view/title": [
         {
           "command": "redmine.refresh",
@@ -251,14 +296,19 @@
           "group": "navigation@3"
         },
         {
-          "command": "redmine.configure",
+          "command": "redmine.createIssue",
           "when": "view == redmine.issueList",
           "group": "navigation@4"
         },
         {
-          "command": "redmine.feedback",
+          "command": "redmine.configure",
           "when": "view == redmine.issueList",
           "group": "navigation@5"
+        },
+        {
+          "command": "redmine.feedback",
+          "when": "view == redmine.issueList && redmine.isConfigured",
+          "group": "navigation@6"
         }
       ],
       "view/item/context": [
@@ -303,7 +353,7 @@
   },
   "dependencies": {
     "axios": "^1.6.0",
-    "marked": "^18.0.3"
+    "marked": "^4.3.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -29,6 +29,8 @@ export interface Issue {
   updated_on: string;
   journals?: Journal[];
   attachments?: Attachment[];
+  /** Present on REST responses when visible to the user (no admin custom_fields.json needed). */
+  custom_fields?: Array<{ id: number; name: string; value?: string | string[] }>;
 }
 
 export interface Journal {
@@ -212,6 +214,140 @@ export async function listPriorities(): Promise<Priority[]> {
   return res.data.issue_priorities;
 }
 
+export interface CustomField {
+  id: number;
+  name: string;
+  field_format: string;
+  is_required: boolean;
+  multiple: boolean;
+  default_value: string;
+  possible_values?: { value: string; label: string }[];
+  trackers?: { id: number; name: string }[];
+}
+
+export async function listCustomFields(): Promise<CustomField[]> {
+  // Try admin endpoint first
+  try {
+    const res = await getClient().get("/custom_fields.json");
+    const all = res.data.custom_fields as (CustomField & { customized_type: string })[];
+    const fields = all.filter((f) => f.customized_type === "issue");
+    if (fields.length > 0) return fields;
+  } catch { /* fall through */ }
+  return [];
+}
+
+/** Custom field id + label as returned on issues (Redmine may localize names). */
+export type IssueCustomFieldDef = { id: number; name: string };
+
+/** Load custom field id+name from one issue (GET /issues/:id.json — works without admin). */
+export async function fetchIssueCustomFieldDefs(issueId: number): Promise<IssueCustomFieldDef[]> {
+  const res = await getClient().get(`/issues/${issueId}.json`);
+  const issue = res.data.issue as { custom_fields?: Array<{ id: number; name: string }> };
+  return (issue.custom_fields ?? []).map((cf) => ({ id: cf.id, name: cf.name }));
+}
+
+/** Merge custom field definitions from issue objects (e.g. sidebar list or issues.json). */
+export function mergeCustomFieldsFromIssues(
+  issues: Array<{ custom_fields?: Array<{ id: number; name: string }> }>,
+): IssueCustomFieldDef[] {
+  const byId = new Map<number, string>();
+  for (const issue of issues) {
+    for (const cf of issue.custom_fields ?? []) {
+      if (!byId.has(cf.id)) byId.set(cf.id, cf.name);
+    }
+  }
+  return Array.from(byId.entries()).map(([id, name]) => ({ id, name }));
+}
+
+/**
+ * List distinct custom fields for a tracker (merged across several issues).
+ * `projectId` may be omitted — Redmine still accepts `tracker_id` alone.
+ */
+export async function discoverCustomFields(
+  projectId: string | undefined,
+  trackerId: string,
+): Promise<IssueCustomFieldDef[]> {
+  try {
+    const params: Record<string, string | number> = {
+      tracker_id: trackerId,
+      limit: 30,
+      sort: "updated_on:desc",
+    };
+    if (projectId?.trim()) params.project_id = projectId.trim();
+    const res = await getClient().get("/issues.json", { params });
+    const issues = res.data.issues as Array<{ custom_fields?: Array<{ id: number; name: string }> }>;
+    return mergeCustomFieldsFromIssues(issues);
+  } catch {
+    return [];
+  }
+}
+
+/** Map Redmine labels to the three Bug form slots (case-insensitive / spacing tolerant). */
+export function mapDiscoveredCustomFieldsToBugTrackerUi(
+  discovered: IssueCustomFieldDef[],
+): { id: number; name: string }[] {
+  const matchers: Array<{ name: string; test: (n: string) => boolean }> = [
+    { name: "Type Bug", test: (n) => /type\s*bug/i.test(n.trim()) },
+    { name: "Found in", test: (n) => /found\s*in/i.test(n.trim()) },
+    { name: "Root Cause", test: (n) => /root\s*cause/i.test(n.trim()) },
+  ];
+  return matchers.map(({ name, test }) => {
+    const hit = discovered.find((d) => test(d.name));
+    return { id: hit?.id ?? 0, name };
+  });
+}
+
+function bugTrackerCustomFieldMappingComplete(defs: IssueCustomFieldDef[]): boolean {
+  return mapDiscoveredCustomFieldsToBugTrackerUi(defs).every((f) => f.id > 0);
+}
+
+/**
+ * Resolve Bug custom field ids without admin: merge fields from cached issues, then
+ * issues.json for this tracker, then GET the first matching issue if the list omitted cfs.
+ */
+export async function resolveBugCustomFieldDefinitions(
+  projectId: string | undefined,
+  trackerId: string,
+  cachedBugIssues: Issue[],
+): Promise<IssueCustomFieldDef[]> {
+  const byId = new Map<number, string>();
+  const add = (defs: IssueCustomFieldDef[]) => {
+    for (const d of defs) {
+      if (!byId.has(d.id)) byId.set(d.id, d.name);
+    }
+  };
+
+  add(mergeCustomFieldsFromIssues(cachedBugIssues));
+
+  const tid = trackerId.trim();
+  if (tid) {
+    add(await discoverCustomFields(projectId, tid).catch(() => []));
+  }
+
+  let defs = Array.from(byId.entries()).map(([id, name]) => ({ id, name }));
+  if (!bugTrackerCustomFieldMappingComplete(defs) && tid) {
+    try {
+      const params: Record<string, string | number> = {
+        tracker_id: tid,
+        limit: 1,
+        sort: "updated_on:desc",
+      };
+      if (projectId?.trim()) params.project_id = projectId.trim();
+      const res = await getClient().get("/issues.json", { params });
+      const issues = (res.data.issues ?? []) as Issue[];
+      add(mergeCustomFieldsFromIssues(issues));
+      defs = Array.from(byId.entries()).map(([id, name]) => ({ id, name }));
+      const first = issues[0];
+      if (first && !bugTrackerCustomFieldMappingComplete(defs)) {
+        add(await fetchIssueCustomFieldDefs(first.id).catch(() => []));
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return Array.from(byId.entries()).map(([id, name]) => ({ id, name }));
+}
+
 export async function createIssue(params: {
   projectId: string;
   subject: string;
@@ -219,18 +355,35 @@ export async function createIssue(params: {
   assignedToId?: number;
   statusId?: number;
   trackerId?: number;
+  priorityId?: number;
+  dueDate?: string;
+  uploads?: UploadToken[];
+  customFields?: { id: number; value: string | string[] }[];
 }): Promise<Issue> {
   const body: Record<string, unknown> = {
     project_id: params.projectId,
     subject: params.subject,
   };
-  if (params.description) body["description"] = params.description;
+  if (params.description)  body["description"]    = params.description;
   if (params.assignedToId) body["assigned_to_id"] = params.assignedToId;
-  if (params.statusId) body["status_id"] = params.statusId;
-  if (params.trackerId) body["tracker_id"] = params.trackerId;
+  if (params.statusId)     body["status_id"]      = params.statusId;
+  if (params.trackerId)    body["tracker_id"]     = params.trackerId;
+  if (params.priorityId)   body["priority_id"]    = params.priorityId;
+  if (params.dueDate)      body["due_date"]       = params.dueDate;
+  if (params.uploads?.length) body["uploads"]     = params.uploads;
+  if (params.customFields?.length) body["custom_fields"] = params.customFields;
 
-  const res = await getClient().post("/issues.json", { issue: body });
-  return res.data.issue;
+  try {
+    const res = await getClient().post("/issues.json", { issue: body });
+    return res.data.issue;
+  } catch (err: unknown) {
+    const axiosErr = err as { response?: { data?: { errors?: string[] } } };
+    const errors = axiosErr?.response?.data?.errors;
+    if (Array.isArray(errors) && errors.length) {
+      throw new Error(errors.join(", "));
+    }
+    throw err;
+  }
 }
 
 export async function deleteAttachment(id: number): Promise<void> {

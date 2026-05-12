@@ -428,4 +428,9 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   getIssueById(id: number): Issue | undefined {
     return this.issues.find((i) => i.id === id);
   }
+
+  /** Issues currently shown in the sidebar (same payload as listIssues / getIssue). */
+  getLoadedIssues(): Issue[] {
+    return [...this.issues];
+  }
 }

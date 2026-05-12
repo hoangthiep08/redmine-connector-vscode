@@ -2,12 +2,12 @@ import * as vscode from "vscode";
 import {
   configureClient,
   getIssue,
+  listIssues,
   listProjects,
   listStatuses,
   listProjectMembers,
   listTrackers,
   updateIssue,
-  createIssue,
   IssueStatus,
   Project,
   Member,
@@ -17,6 +17,8 @@ import { IssueProvider, IssueTreeItem, GroupByMode } from "./issue-provider";
 import { IssueWebview } from "./issue-webview";
 import { SettingsWebview } from "./settings-webview";
 import { FeedbackWebview } from "./feedback-webview";
+import { CreateIssueWebview } from "./create-issue-webview";
+import { TestCaseWebview } from "./testcase-webview";
 import { pushIssueToAI, copyIssueMarkdown } from "./push-to-ai";
 import { registerChatParticipant } from "./chat-participant";
 
@@ -28,6 +30,8 @@ export function activate(context: vscode.ExtensionContext) {
   const settingsWebview = new SettingsWebview(context);
 
   const feedbackWebview = new FeedbackWebview(context);
+  const createIssueWebview = new CreateIssueWebview(context, provider);
+  const testCaseWebview = new TestCaseWebview(context, createIssueWebview);
 
   const treeView = vscode.window.createTreeView("redmine.issueList", {
     treeDataProvider: provider,
@@ -175,50 +179,12 @@ export function activate(context: vscode.ExtensionContext) {
     }],
 
     ["redmine.createIssue", async () => {
-      let projects: Project[];
-      try {
-        projects = await listProjects();
-      } catch (err) {
-        vscode.window.showErrorMessage(`Failed to load projects: ${err}`);
-        return;
-      }
-      const projectPick = await vscode.window.showQuickPick(
-        projects.map((p) => ({ label: p.name, id: p.identifier })),
-        { title: "Create Issue — Select Project" }
-      );
-      if (!projectPick) return;
+      await createIssueWebview.show();
+    }],
 
-      const subject = await vscode.window.showInputBox({
-        title: "Create Issue — Subject",
-        prompt: "Issue title",
-        ignoreFocusOut: true,
-      });
-      if (!subject?.trim()) return;
-
-      const description = await vscode.window.showInputBox({
-        title: "Create Issue — Description (optional)",
-        prompt: "Issue description",
-        ignoreFocusOut: true,
-      });
-
-      try {
-        const issue = await createIssue({
-          projectId: projectPick.id,
-          subject,
-          description: description || undefined,
-        });
-        vscode.window.showInformationMessage(
-          `Issue #${issue.id} created: ${issue.subject}`,
-          "Open"
-        ).then((choice) => {
-          if (choice === "Open") {
-            vscode.commands.executeCommand("redmine.openIssue", { issue });
-          }
-        });
-        provider.refresh();
-      } catch (err) {
-        vscode.window.showErrorMessage(`Failed to create issue: ${err}`);
-      }
+    ["redmine.openTestCase", async (...args: unknown[]) => {
+      const uri = args[0] instanceof vscode.Uri ? args[0] : undefined;
+      await testCaseWebview.show(uri);
     }],
 
     ["redmine.filterByProject", () => vscode.commands.executeCommand("redmine.filter", "project")],
@@ -440,14 +406,45 @@ export function activate(context: vscode.ExtensionContext) {
     settingsWebview.show();
   } else {
     provider.refresh();
+    initBugCustomFieldCache(context).catch(() => {});
   }
+}
+
+async function initBugCustomFieldCache(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    const trackers = await listTrackers();
+    const bugTracker = trackers.find((t) => /^bug$/i.test(t.name.trim()));
+    if (!bugTracker) return;
+
+    const cfg = vscode.workspace.getConfiguration("redmine");
+    const projectId = cfg.get<string>("defaultProject") || undefined;
+
+    const result = await listIssues({
+      trackerId: String(bugTracker.id),
+      projectId,
+      limit: 1,
+    });
+
+    if (!result.issues.length) {
+      await context.globalState.update("bugIssueExists", false);
+      await context.globalState.update("bugCustomFieldDefs", []);
+      return;
+    }
+
+    await context.globalState.update("bugIssueExists", true);
+    const fullIssue = await getIssue(result.issues[0].id);
+    const cfs = (fullIssue.custom_fields ?? []).map((cf) => ({ id: cf.id, name: cf.name }));
+    await context.globalState.update("bugCustomFieldDefs", cfs);
+  } catch { /* silent, non-blocking */ }
 }
 
 function initClient() {
   const config = vscode.workspace.getConfiguration("redmine");
   const baseUrl = config.get<string>("baseUrl") ?? "";
   const apiKey = config.get<string>("apiKey") ?? "";
-  if (baseUrl && apiKey) {
+  const configured = !!(baseUrl && apiKey);
+  vscode.commands.executeCommand("setContext", "redmine.isConfigured", configured);
+  if (configured) {
     configureClient(baseUrl, apiKey);
   }
 }

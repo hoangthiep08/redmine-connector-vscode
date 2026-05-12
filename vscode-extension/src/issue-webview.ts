@@ -223,6 +223,24 @@ export class IssueWebview {
         break;
       }
 
+      case "updateContent": {
+        const subject     = typeof msg.subject     === "string" ? msg.subject.trim()     : undefined;
+        const description = typeof msg.description === "string" ? msg.description        : undefined;
+        if (subject !== undefined && !subject) {
+          vscode.window.showErrorMessage("Subject cannot be empty.");
+          this.panel?.webview.postMessage({ command: "editError" });
+          return;
+        }
+        try {
+          await updateIssue(this.currentIssue!.id, { subject, description });
+          await this.refresh();
+        } catch (err) {
+          vscode.window.showErrorMessage(`${err}`);
+          this.panel?.webview.postMessage({ command: "editError" });
+        }
+        break;
+      }
+
       case "deleteAttachment": {
         const attachId = msg.attachmentId as number;
         try {
@@ -547,6 +565,7 @@ export class IssueWebview {
   </div>
   <div class="action-bar">
     <button class="btn btn-primary" onclick="vsc('pushToAI')">⚡ Push to AI</button>
+    <button class="btn" onclick="openEditContent()">✏ Edit</button>
     <button class="btn" onclick="vsc('openInBrowser')">🌐 Browser</button>
   </div>
 </div>
@@ -590,10 +609,26 @@ export class IssueWebview {
   <!-- Description -->
   <div class="section">
     <div class="section-title">Description</div>
-    <div class="desc-box">
+    <div class="desc-box" id="descView">
       ${issue.description
         ? `<div class="rich-text">${renderText(issue.description, undefined, getBaseUrl())}</div>`
         : `<div class="empty-note">No description provided.</div>`}
+    </div>
+    <div class="edit-content-panel" id="editContentPanel" style="display:none;margin-top:8px">
+      <div class="field" style="margin-bottom:10px">
+        <label class="meta-label" for="editSubject" style="display:block;margin-bottom:5px">Subject</label>
+        <input type="text" id="editSubject" maxlength="255"
+               style="width:100%;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,#555);border-radius:5px;padding:7px 10px;font-family:inherit;font-size:inherit;outline:none"
+               value="${esc(issue.subject)}">
+      </div>
+      <div class="field">
+        <label class="meta-label" for="editDescription" style="display:block;margin-bottom:5px">Description</label>
+        <textarea id="editDescription" style="min-height:180px;line-height:1.6">${esc(issue.description ?? "")}</textarea>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <button class="btn btn-primary btn-sm" id="editContentSave" onclick="saveEditContent()">💾 Save</button>
+        <button class="btn btn-ghost btn-sm" onclick="cancelEditContent()">Cancel</button>
+      </div>
     </div>
   </div>
 
@@ -777,6 +812,25 @@ export class IssueWebview {
     vsc('editComment', { journalId: id, notes });
   }
 
+  // ── Edit issue content (subject + description) ───────────
+  function openEditContent() {
+    document.getElementById('descView').style.display = 'none';
+    document.getElementById('editContentPanel').style.display = '';
+    document.getElementById('editSubject').focus();
+  }
+  function cancelEditContent() {
+    document.getElementById('descView').style.display = '';
+    document.getElementById('editContentPanel').style.display = 'none';
+  }
+  function saveEditContent() {
+    const subject     = document.getElementById('editSubject').value.trim();
+    const description = document.getElementById('editDescription').value;
+    if (!subject) { alert('Subject cannot be empty.'); return; }
+    const btn = document.getElementById('editContentSave');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    vsc('updateContent', { subject, description });
+  }
+
   // ── Delete comment ────────────────────────────────────────
   function showDelete(id) { closeAllForms(); document.getElementById('del-' + id).classList.add('open'); }
   function cancelDelete(id) { document.getElementById('del-' + id).classList.remove('open'); }
@@ -824,6 +878,10 @@ export class IssueWebview {
     }
     if (msg.command === 'imageError') {
       document.querySelectorAll('img[data-aid="' + msg.attachmentId + '"]').forEach(img => { img.alt = '⚠ Error'; img.style.opacity = '.4'; });
+    }
+    if (msg.command === 'editError') {
+      const btn = document.getElementById('editContentSave');
+      if (btn) { btn.disabled = false; btn.textContent = '💾 Save'; }
     }
     if (msg.command === 'commentError' || msg.command === 'deleteError') {
       document.querySelectorAll('button[disabled]').forEach(btn => {
