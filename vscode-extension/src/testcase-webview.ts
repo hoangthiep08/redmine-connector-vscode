@@ -15,6 +15,12 @@ interface TC {
   statusQc: string;
   date: string;
   line: number;
+  browser?: string;
+  device?: string;
+  evidence?: string;
+  typeBug?: string;
+  foundIn?: string;
+  rootCause?: string;
 }
 
 interface LinkedIssue {
@@ -65,21 +71,40 @@ function parseMarkdownTable(content: string): TC[] {
       return idx !== undefined ? (cells[idx] ?? "").trim() : "";
     };
 
+    // Flexible match: exact first, then any column name that contains the keyword
+    const find = (...keywords: string[]): string => {
+      for (const kw of keywords) {
+        const v = get(kw);
+        if (v) return v;
+      }
+      for (const kw of keywords) {
+        const key = Object.keys(colMap).find(k => k.includes(kw.toLowerCase()));
+        if (key !== undefined) return (cells[colMap[key]] ?? "").trim();
+      }
+      return "";
+    };
+
     const tcId = get("tc id");
     if (!tcId || /^:?-+:?$/.test(tcId)) continue;
 
     tcs.push({
       tcId,
-      category: get("category"),
-      module: get("module"),
-      scenario: get("test scenario"),
-      priority: get("priority"),
-      steps: get("steps"),
-      expected: get("expected"),
-      actual: get("actual"),
-      statusQc: get("status qc"),
-      date: get("date"),
+      category: find("category"),
+      module: find("module"),
+      scenario: find("test scenario", "scenario"),
+      priority: find("priority"),
+      steps: find("steps"),
+      expected: find("expected"),
+      actual: find("actual"),
+      statusQc: find("status qc"),
+      date: find("date"),
       line: i + 1,
+      browser:   find("browser", "browsers")                         || undefined,
+      device:    find("device", "devices", "platform", "os")        || undefined,
+      evidence:  find("evidence", "screenshot", "attachment")       || undefined,
+      typeBug:   find("type bug", "bug type")                       || undefined,
+      foundIn:   find("found in", "found_in", "foundin")            || undefined,
+      rootCause: find("root cause", "root_cause", "rootcause")      || undefined,
     });
   }
 
@@ -93,8 +118,10 @@ function formatDescription(tc: TC): string {
     `Category: ${tc.category}`,
     `Module: ${tc.module}`,
     `Priority: ${tc.priority}`,
-    "",
   ];
+  if (tc.browser) lines.push(`Browser: ${tc.browser}`);
+  if (tc.device)  lines.push(`Device: ${tc.device}`);
+  lines.push("");
   if (tc.steps) {
     lines.push("Steps:");
     lines.push(br2nl(tc.steps));
@@ -110,6 +137,40 @@ function formatDescription(tc: TC): string {
     lines.push(br2nl(tc.actual));
   }
   return lines.join("\n");
+}
+
+function parseEvidenceAttachments(
+  evidenceCell: string,
+  mdDir: string,
+): { data: string; filename: string; contentType: string }[] {
+  const br2nl = (s: string) => s.replace(/<br\s*\/?>/gi, "\n");
+  const text = br2nl(evidenceCell);
+  const found = new Set<string>();
+
+  // Markdown image: ![alt](path)
+  const mdRe = /!\[.*?\]\((.+?)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = mdRe.exec(text)) !== null) found.add(m[1].trim());
+
+  // Bare image path tokens
+  for (const token of text.split(/[\n,;]/)) {
+    const t = token.trim();
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(t) && !t.startsWith("!"))
+      found.add(t);
+  }
+
+  const results: { data: string; filename: string; contentType: string }[] = [];
+  for (const imgPath of found) {
+    const fullPath = path.isAbsolute(imgPath) ? imgPath : path.resolve(mdDir, imgPath);
+    if (!fs.existsSync(fullPath)) continue;
+    try {
+      const data = fs.readFileSync(fullPath).toString("base64");
+      const ext = path.extname(fullPath).toLowerCase().replace(".", "");
+      const contentType = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : `image/${ext}`;
+      results.push({ data, filename: path.basename(fullPath), contentType });
+    } catch { /* skip unreadable files */ }
+  }
+  return results;
 }
 
 function e(s: string): string {
@@ -205,12 +266,23 @@ export class TestCaseWebview {
         const tc = msg.tc as TC;
         const filePath = this.currentFilePath;
         if (!filePath) return;
+
+        const mdDir = path.dirname(filePath);
+        const preAttachments = tc.evidence ? parseEvidenceAttachments(tc.evidence, mdDir) : [];
+
+        const customFieldValues: Record<string, string> = {};
+        if (tc.typeBug)   customFieldValues["Type Bug"]   = tc.typeBug;
+        if (tc.foundIn)   customFieldValues["Found in"]   = tc.foundIn;
+        if (tc.rootCause) customFieldValues["Root Cause"] = tc.rootCause;
+
         await this.createIssueWebview.show(
           {
             subject: `[${tc.tcId}] ${tc.scenario}`,
             description: formatDescription(tc),
             trackerName: "Bug",
             statusName: "New",
+            customFieldValues: Object.keys(customFieldValues).length ? customFieldValues : undefined,
+            preAttachments: preAttachments.length ? preAttachments : undefined,
           },
           (issueId, subject) => {
             const map = this.getLinkMap();
@@ -247,8 +319,8 @@ function buildHtml(fileName: string, filePath: string, tcs: TC[], linkMap: Issue
     const linked = linkMap[mapKey(filePath, tc.tcId)];
     if (linked) linksForFile[tc.tcId] = linked;
   }
-  const failCount     = tcs.filter(t => t.statusQc.toLowerCase() === "fail").length;
-  const passCount     = tcs.filter(t => t.statusQc.toLowerCase() === "pass").length;
+  const failCount     = tcs.filter(t => ["fail", "ng"].includes(t.statusQc.toLowerCase())).length;
+  const passCount     = tcs.filter(t => ["pass", "ok"].includes(t.statusQc.toLowerCase())).length;
   const skipCount     = tcs.filter(t => ["skip", "skipped"].includes(t.statusQc.toLowerCase())).length;
   const blockedCount  = tcs.filter(t => t.statusQc.toLowerCase() === "blocked").length;
   const notTestedCount = tcs.filter(t => !t.statusQc || t.statusQc === "—").length;
@@ -373,9 +445,50 @@ function buildHtml(fileName: string, filePath: string, tcs: TC[], linkMap: Issue
     font-size: .78em; padding: 2px 4px;
   }
   .issue-unlink:hover { color: var(--vscode-errorForeground); }
+
+  /* Confirm modal */
+  .modal-backdrop {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.45); z-index: 100;
+    align-items: center; justify-content: center;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal-box {
+    background: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-widget-border, #444);
+    border-radius: 8px; padding: 20px 24px;
+    max-width: 340px; width: 90%;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  }
+  .modal-title { font-weight: 700; margin-bottom: 8px; font-size: 1em; }
+  .modal-body  { font-size: .88em; color: var(--vscode-descriptionForeground); margin-bottom: 18px; line-height: 1.5; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-btn {
+    padding: 5px 16px; border-radius: 4px; border: none; cursor: pointer;
+    font-family: inherit; font-size: .85em; font-weight: 600;
+  }
+  .modal-btn.cancel {
+    background: var(--vscode-button-secondaryBackground, #3c3c3c);
+    color: var(--vscode-button-secondaryForeground, #ccc);
+  }
+  .modal-btn.danger {
+    background: #c0392b; color: #fff;
+  }
+  .modal-btn:hover { opacity: .85; }
 </style>
 </head>
 <body>
+
+<div class="modal-backdrop" id="confirmModal">
+  <div class="modal-box">
+    <div class="modal-title">Unlink Issue</div>
+    <div class="modal-body" id="confirmModalBody"></div>
+    <div class="modal-actions">
+      <button class="modal-btn cancel" onclick="closeModal()">Cancel</button>
+      <button class="modal-btn danger" id="confirmModalOk">Unlink</button>
+    </div>
+  </div>
+</div>
 
 <div class="page-header">
   <div class="title">Test Case Report</div>
@@ -427,8 +540,8 @@ function priorityClass(p) {
 
 function statusClass(s) {
   const ls = (s || '').toLowerCase();
-  if (ls === 'fail') return 'fail';
-  if (ls === 'pass') return 'pass';
+  if (ls === 'fail' || ls === 'ng') return 'fail';
+  if (ls === 'pass' || ls === 'ok') return 'pass';
   if (ls === 'skip' || ls === 'skipped') return 'skip';
   if (ls === 'blocked') return 'blocked';
   return 'none';
@@ -471,10 +584,32 @@ function openIssue(issueId) {
   vscode.postMessage({ command: 'openIssue', issueId: issueId });
 }
 
+let _pendingUnlinkTcId = null;
+
 function unlinkIssue(tcId) {
-  if (!confirm('Unlink this issue from the test case? You can recreate it later.')) return;
-  vscode.postMessage({ command: 'unlinkIssue', tcId: tcId });
+  const linked = LINKS[tcId];
+  _pendingUnlinkTcId = tcId;
+  document.getElementById('confirmModalBody').textContent =
+    'Remove link to issue #' + (linked ? linked.issueId : '?') + ' from this test case? The issue on Redmine will not be deleted.';
+  document.getElementById('confirmModal').classList.add('open');
+  document.getElementById('confirmModalOk').focus();
 }
+
+function closeModal() {
+  _pendingUnlinkTcId = null;
+  document.getElementById('confirmModal').classList.remove('open');
+}
+
+document.getElementById('confirmModalOk').onclick = function() {
+  if (!_pendingUnlinkTcId) return;
+  const tcId = _pendingUnlinkTcId;
+  closeModal();
+  vscode.postMessage({ command: 'unlinkIssue', tcId: tcId });
+};
+
+document.getElementById('confirmModal').addEventListener('click', function(ev) {
+  if (ev.target === this) closeModal();
+});
 
 render();
 </script>

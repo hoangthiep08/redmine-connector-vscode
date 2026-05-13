@@ -110,6 +110,28 @@ Use the **$(feedback) Send Feedback** button in the sidebar toolbar to report bu
 
 ## Release Notes
 
+### 1.2.0 ✨ Test Case → Issue Template System
+- **Test Case Viewer**: Open markdown test case files, parse structured tables, view test results in a rich report
+- **Test Case Template Builder**: Settings → Test Case Template tab to define how test case columns map to issue fields
+  - Support template syntax: `{{columnName}}` for field interpolation, concat multiple columns
+  - Configurable fields: Subject, Description, Tracker, Status, Assignee, Priority, Due Date, Attachments
+  - Global template saved in settings, reusable across all test case files
+- **Create Issue from Test Case**: Failed test cases now show "✚ Create Issue" button that pre-fills forms based on template
+  - Auto-extract data from configured columns
+  - Attachment support: auto-fetch image files referenced in test evidence
+- **Bug Tracker Custom Fields**: 
+  - Settings to configure Bug tracker field IDs (Type Bug, Found in, Root Cause)
+  - Auto-detect fields from existing Bug issues if admin API unavailable
+  - Custom fields pre-filled when creating issues from failed test cases
+- **Template Validation**: Warning banner if no template is set; disable Create Issue button until template is configured
+- **Feedback Button**: Only visible when Redmine connection is configured
+
+### 1.1.0
+- Create Issue webview with full form (project, tracker, status, priority, assignee, due date, attachments)
+- Custom field support with drag-drop and autocomplete in create form
+- Default tracker = Bug + status = New when creating from test cases
+- Test case right-click context menu: "Redmine: View Test Case"
+
 ### 1.0.1
 - Inline status, assignee, and progress editing in issue detail view
 - Smart search by issue number (`#123`)

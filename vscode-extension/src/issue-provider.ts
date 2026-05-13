@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { Issue, listIssues, getIssue } from "./redmine-client";
+import { Issue, listIssues, listProjects, getIssue } from "./redmine-client";
 
 export interface IssueFilter {
   projectId?: string;
@@ -66,9 +66,10 @@ export class ProjectGroupItem extends vscode.TreeItem {
     public readonly projectName: string,
     public readonly projectId: number,
     count: number,
+    hasMore = false,
   ) {
     super(projectName, vscode.TreeItemCollapsibleState.Expanded);
-    this.description = `${count} issue${count !== 1 ? "s" : ""}`;
+    this.description = `${count}${hasMore ? "+" : ""} issue${count !== 1 ? "s" : ""}`;
     this.iconPath = new vscode.ThemeIcon("folder-opened", new vscode.ThemeColor("notificationsInfoIcon.foreground"));
     this.contextValue = "projectGroup";
   }
@@ -127,6 +128,21 @@ class LoadMoreItem extends vscode.TreeItem {
   }
 }
 
+class LoadMoreProjectItem extends vscode.TreeItem {
+  constructor(public readonly projectId: number, loaded: number) {
+    super(`Load more (showing ${loaded})`, vscode.TreeItemCollapsibleState.None);
+    this.iconPath = new vscode.ThemeIcon("chevron-down");
+    this.command = { command: "redmine.loadMoreProject", title: "Load More", arguments: [projectId] };
+  }
+}
+
+interface ProjectData {
+  name: string;
+  issues: Issue[];
+  hasMore: boolean;
+  offset: number;
+}
+
 export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined | null>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -139,7 +155,13 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private groupBy: GroupByMode = "project";
   private offset = 0;
   private hasMore = false;
-  private readonly PAGE_SIZE = 20;
+  private readonly PAGE_SIZE_MULTI = 10;  // per-project initial load
+  private readonly PAGE_SIZE = 20;         // single-project / flat pagination
+
+  // Per-project state (used when no project filter + groupBy=project)
+  private multiProjectMode = false;
+  private projectsData = new Map<number, ProjectData>();
+  private loadingMoreProject: number | null = null;
 
   setGroupBy(mode: GroupByMode) {
     this.groupBy = mode;
@@ -240,6 +262,83 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     await this.load(true);
   }
 
+  async loadMoreProject(projectId: number) {
+    const pd = this.projectsData.get(projectId);
+    if (!pd || !pd.hasMore || this.loadingMoreProject !== null) return;
+    this.loadingMoreProject = projectId;
+    this._onDidChangeTreeData.fire(null);
+
+    try {
+      const { statusId, assignedToId, trackerId, customStatusIds } = await this.resolveQueryParams();
+      const result = await listIssues({
+        projectId: String(projectId),
+        statusId,
+        assignedToId,
+        trackerId,
+        subject: this.filter.subject,
+        limit: this.PAGE_SIZE_MULTI,
+        offset: pd.offset,
+      });
+      const fetched = customStatusIds.length
+        ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
+        : result.issues;
+
+      pd.issues = [...pd.issues, ...fetched];
+      pd.offset = pd.issues.length;
+      pd.hasMore = result.total_count > pd.issues.length;
+      this.issues = Array.from(this.projectsData.values()).flatMap((p) => p.issues);
+    } catch {
+      // silently fail — existing issues remain
+    } finally {
+      this.loadingMoreProject = null;
+      this._onDidChangeTreeData.fire(null);
+    }
+  }
+
+  private async resolveQueryParams(): Promise<{
+    statusId: string;
+    assignedToId: string | undefined;
+    trackerId: string | undefined;
+    customStatusIds: string[];
+  }> {
+    const config = vscode.workspace.getConfiguration("redmine");
+    const onlyMe = config.get<boolean>("showOnlyAssignedToMe") ?? false;
+
+    let assignedToId: string | undefined;
+    if (this.filter.assignedToMe) {
+      assignedToId = "me";
+    } else if (this.filter.assignedToId) {
+      assignedToId = this.filter.assignedToId;
+    } else {
+      const assigneeMode = config.get<string>("defaultAssigneeMode") ?? "all";
+      if (assigneeMode === "me" || onlyMe) {
+        assignedToId = "me";
+      } else if (assigneeMode === "custom") {
+        const cid = config.get<string>("defaultAssigneeId") ?? "";
+        if (cid) assignedToId = cid;
+      }
+    }
+
+    let statusId: string;
+    let customStatusIds: string[] = [];
+    if (this.filter.statusId) {
+      statusId = this.filter.statusId;
+    } else {
+      const mode = config.get<string>("defaultStatusMode") ?? "open";
+      if (mode === "custom") {
+        customStatusIds = config.get<string[]>("defaultStatusIds") ?? [];
+        statusId = customStatusIds.length ? "*" : "open";
+      } else {
+        statusId = mode || "open";
+      }
+    }
+
+    const defaultTrackerId = config.get<string>("defaultTrackerId") ?? "";
+    const trackerId = this.filter.trackerId || defaultTrackerId || undefined;
+
+    return { statusId, assignedToId, trackerId, customStatusIds };
+  }
+
   private async load(append = false) {
     if (append) {
       this.loadingMore = true;
@@ -252,44 +351,13 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     try {
       const config = vscode.workspace.getConfiguration("redmine");
       const defaultProject = config.get<string>("defaultProject") ?? "";
-      const onlyMe = config.get<boolean>("showOnlyAssignedToMe") ?? false;
+      const { statusId, assignedToId, trackerId, customStatusIds } = await this.resolveQueryParams();
 
-      let assignedToId: string | undefined;
-      if (this.filter.assignedToMe) {
-        assignedToId = "me";
-      } else if (this.filter.assignedToId) {
-        assignedToId = this.filter.assignedToId;
-      } else {
-        // No active session filter — apply config defaults
-        const assigneeMode = config.get<string>("defaultAssigneeMode") ?? "all";
-        if (assigneeMode === "me" || onlyMe) {
-          assignedToId = "me";
-        } else if (assigneeMode === "custom") {
-          const cid = config.get<string>("defaultAssigneeId") ?? "";
-          if (cid) assignedToId = cid;
-        }
-      }
-
-      // Resolve status filter: active filter > config defaults
-      let statusId: string;
-      let customStatusIds: string[] = [];
-      if (this.filter.statusId) {
-        statusId = this.filter.statusId;
-      } else {
-        const mode = config.get<string>("defaultStatusMode") ?? "open";
-        if (mode === "custom") {
-          customStatusIds = config.get<string[]>("defaultStatusIds") ?? [];
-          statusId = customStatusIds.length ? "*" : "open";
-        } else {
-          statusId = mode || "open";
-        }
-      }
-
-      // If search term is a number or #number, fetch that issue directly by ID
       const subjectTerm = this.filter.subject?.trim() ?? "";
       const idMatch = /^#?(\d+)$/.exec(subjectTerm);
 
       if (idMatch) {
+        // Direct fetch by issue ID
         try {
           const issue = await getIssue(parseInt(idMatch[1], 10));
           this.issues = [issue];
@@ -298,32 +366,74 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
           this.issues = [];
           this.hasMore = false;
         }
+        this.multiProjectMode = false;
       } else {
-        const defaultTrackerId = config.get<string>("defaultTrackerId") ?? "";
-        const trackerId = this.filter.trackerId || defaultTrackerId || undefined;
+        const hasProjectFilter = !!(this.filter.projectId || defaultProject);
+        const useMultiProject = !hasProjectFilter && this.groupBy === "project";
 
-        const result = await listIssues({
-          projectId: this.filter.projectId || defaultProject || undefined,
-          statusId,
-          assignedToId,
-          trackerId,
-          subject: this.filter.subject,
-          limit: this.PAGE_SIZE,
-          offset: append ? this.offset : 0,
-        });
+        if (useMultiProject && !append) {
+          // Fetch projects then 10 issues per project
+          this.multiProjectMode = true;
+          this.projectsData = new Map();
 
-        const fetched = customStatusIds.length
-          ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
-          : result.issues;
+          const projects = await listProjects();
+          await Promise.all(
+            projects.slice(0, 20).map(async (p) => {
+              try {
+                const result = await listIssues({
+                  projectId: String(p.id),
+                  statusId,
+                  assignedToId,
+                  trackerId,
+                  subject: this.filter.subject,
+                  limit: this.PAGE_SIZE_MULTI,
+                  offset: 0,
+                });
+                const fetched = customStatusIds.length
+                  ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
+                  : result.issues;
+                if (fetched.length > 0) {
+                  this.projectsData.set(p.id, {
+                    name: p.name,
+                    issues: fetched,
+                    hasMore: result.total_count > fetched.length,
+                    offset: fetched.length,
+                  });
+                }
+              } catch {
+                // skip projects that fail
+              }
+            })
+          );
 
-        if (append) {
-          this.issues = [...this.issues, ...fetched];
+          this.issues = Array.from(this.projectsData.values()).flatMap((pd) => pd.issues);
+          this.hasMore = false;
         } else {
-          this.issues = fetched;
-        }
+          // Single-project or non-project-grouped: global pagination
+          this.multiProjectMode = false;
+          const result = await listIssues({
+            projectId: this.filter.projectId || defaultProject || undefined,
+            statusId,
+            assignedToId,
+            trackerId,
+            subject: this.filter.subject,
+            limit: this.PAGE_SIZE,
+            offset: append ? this.offset : 0,
+          });
 
-        this.offset = this.issues.length;
-        this.hasMore = result.total_count > this.issues.length;
+          const fetched = customStatusIds.length
+            ? result.issues.filter((i) => customStatusIds.includes(String(i.status.id)))
+            : result.issues;
+
+          if (append) {
+            this.issues = [...this.issues, ...fetched];
+          } else {
+            this.issues = fetched;
+          }
+
+          this.offset = this.issues.length;
+          this.hasMore = result.total_count > this.issues.length;
+        }
       }
     } catch (err) {
       if (!append) this.error = err instanceof Error ? err.message : String(err);
@@ -342,10 +452,22 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
     // Children of a project group
     if (element instanceof ProjectGroupItem) {
+      if (this.multiProjectMode) {
+        const pd = this.projectsData.get(element.projectId);
+        if (!pd) return [];
+        const items: vscode.TreeItem[] = pd.issues.map((i) => new IssueTreeItem(i));
+        if (this.loadingMoreProject === element.projectId) {
+          items.push(new LoadingItem());
+        } else if (pd.hasMore) {
+          items.push(new LoadMoreProjectItem(element.projectId, pd.issues.length));
+        }
+        return items;
+      }
       return this.issues
         .filter((i) => i.project.id === element.projectId)
         .map((i) => new IssueTreeItem(i));
     }
+
     // Children of a status group
     if (element instanceof StatusGroupItem) {
       return this.issues
@@ -378,6 +500,14 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       return items;
     }
 
+    // Multi-project mode: build groups from projectsData
+    if (this.multiProjectMode) {
+      for (const [projectId, pd] of this.projectsData) {
+        items.push(new ProjectGroupItem(pd.name, projectId, pd.issues.length, pd.hasMore));
+      }
+      return items;
+    }
+
     if (this.groupBy === "project") {
       const map = new Map<number, { name: string; issues: Issue[] }>();
       for (const issue of this.issues) {
@@ -388,6 +518,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       if (map.size > 1) {
         for (const [projectId, { name, issues }] of map)
           items.push(new ProjectGroupItem(name, projectId, issues.length));
+        if (this.hasMore) items.push(new LoadMoreItem(this.issues.length));
         return items;
       }
     } else if (this.groupBy === "status") {

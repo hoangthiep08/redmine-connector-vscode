@@ -3,7 +3,7 @@
   "displayName": "Redmine Connector",
   "description": "Connect your company's Redmine to VS Code, Cursor, Windsurf — manage issues and push to AI chat",
   "publisher": "hoangthiep",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -133,6 +133,11 @@
             "Plain text"
           ],
           "description": "Text format used in your Redmine instance for descriptions and comments"
+        },
+        "redmine.testCaseTemplate": {
+          "type": "object",
+          "default": {},
+          "description": "Template mapping for Test Case → Issue (internal use, set via Test Case Template builder)"
         }
       }
     },

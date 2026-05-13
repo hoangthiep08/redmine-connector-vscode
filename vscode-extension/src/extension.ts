@@ -362,6 +362,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     ["redmine.clearFilters", () => provider.clearFilter()],
     ["redmine.loadMore", () => provider.loadMore()],
+    ["redmine.loadMoreProject", (...args: unknown[]) => provider.loadMoreProject(args[0] as number)],
     ["redmine.feedback", () => feedbackWebview.show()],
 
     ["redmine.groupBy", async () => {

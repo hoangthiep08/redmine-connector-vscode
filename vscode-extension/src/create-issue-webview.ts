@@ -26,7 +26,14 @@ export class CreateIssueWebview {
   ) {}
 
   async show(
-    prefill?: { subject: string; description: string; trackerName?: string; statusName?: string },
+    prefill?: {
+      subject: string;
+      description: string;
+      trackerName?: string;
+      statusName?: string;
+      customFieldValues?: Record<string, string>;
+      preAttachments?: { data: string; filename: string; contentType: string }[];
+    },
     onCreated?: (issueId: number, subject: string) => void,
   ) {
     if (this.panel) {
@@ -200,7 +207,14 @@ function buildHtml(
   priorities: Priority[],
   members:    { id: string; name: string }[],
   logoSrc:    string,
-  prefill?:   { subject: string; description: string; trackerName?: string; statusName?: string },
+  prefill?:   {
+    subject: string;
+    description: string;
+    trackerName?: string;
+    statusName?: string;
+    customFieldValues?: Record<string, string>;
+    preAttachments?: { data: string; filename: string; contentType: string }[];
+  },
 ): string {
   const defaultPriority = priorities.find((p) => p.is_default);
   const openStatuses    = statuses.filter((s) => !s.is_closed);
@@ -493,7 +507,17 @@ function buildHtml(
 
 <script>
   const vscode = acquireVsCodeApi();
-  let pendingFiles = [];
+  const PREFILL_CF    = ${JSON.stringify(prefill?.customFieldValues ?? {})};
+  const PREFILL_FILES = ${JSON.stringify(
+    (prefill?.preAttachments ?? []).map((f, i) => ({
+      id: i + 1,
+      data: f.data,
+      filename: f.filename,
+      contentType: f.contentType,
+      previewUrl: `data:${f.contentType};base64,${f.data}`,
+    }))
+  )};
+  let pendingFiles = PREFILL_FILES.slice();
   let lastIssueId  = null;
   // ── Bug tracker custom fields (hardcoded) ────────────────────────
   const BUG_FIELDS = [
@@ -536,12 +560,14 @@ function buildHtml(
     body.innerHTML = '<div class="row3">' + BUG_FIELDS.map(function(f) {
       const id  = bugFieldIds[f.name] || 0;
       const req = f.required ? '<span style="color:var(--vscode-errorForeground)">*</span>' : '';
+      const prefillVal = PREFILL_CF[f.name] || '';
       const opts = ['<option value="">— Select —</option>']
         .concat(f.options.map(function(o) {
-          return '<option value="' + escHtml(o) + '"' + (o === f.defaultValue ? ' selected' : '') + '>' + escHtml(o) + '</option>';
+          const selected = prefillVal ? (o === prefillVal ? ' selected' : '') : (o === f.defaultValue ? ' selected' : '');
+          return '<option value="' + escHtml(o) + '"' + selected + '>' + escHtml(o) + '</option>';
         })).join('');
       return '<div class="field"><label class="fl">' + escHtml(f.name) + ' ' + req + '</label>'
-        + '<select data-cf-id="' + id + '">' + opts + '</select></div>';
+        + '<select data-cf-id="' + id + '" data-cf-name="' + escHtml(f.name) + '">' + opts + '</select></div>';
     }).join('') + '</div>';
   }
 
@@ -573,7 +599,8 @@ function buildHtml(
     return result;
   }
 
-  // Init: trigger tracker check on load
+  // Init: show pre-loaded evidence attachments and trigger tracker check
+  if (pendingFiles.length) renderPreviews();
   onTrackerChange();
 
   // ── File handling ─────────────────────────────────────────────────

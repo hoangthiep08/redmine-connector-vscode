@@ -2,6 +2,29 @@
 
 All notable changes to the **Redmine Connector** extension are documented in this file.
 
+## [1.2.0]
+
+### Added — Test Case Template System
+- **Test Case Template Builder** — new Settings tab (`Settings → Test Case Template`) to define how test case columns map to issue fields.
+  - Visual template editor: drag/drop columns or type template syntax `{{columnName}}` to interpolate field values.
+  - Support concatenation: `{{col1}} {{col2}}` combines multiple columns with spaces.
+  - Configurable issue fields: Subject, Description, Tracker, Status, Assignee, Priority, Due Date, Attachments.
+  - Global settings storage: template is saved once and reused across all test case files in the workspace.
+- **Template-Driven Issue Creation** — when creating an issue from a failed test case, the extension applies the template to extract and pre-fill form fields.
+  - Auto-interpolate column values into subject and description fields.
+  - Auto-resolve tracker and status names from Redmine if configured.
+  - Auto-fetch attachment files referenced in configured columns (searches for matching files in the test case directory).
+  - Skip empty column mappings gracefully (no "blank field" errors).
+- **Template Validation in Test Case Viewer** — warning banner if no template is configured; "✚ Create Issue" button disabled until template is saved.
+  - Clear user guidance: "Go to Settings → Test Case Template to create one."
+- **Feedback Button Visibility** — feedback button in the sidebar is only shown when connection is fully configured (`baseUrl` + `apiKey` present).
+
+### Fixed
+- **Custom field submission** — marked `{{columnName}}` fields as required in Bug tracker forms only if custom field IDs are configured in Settings.
+- **Extension activation** — downgraded `marked` from ESM-only v18 to CommonJS-compatible v4 to fix "cannot find module" errors on startup.
+
+---
+
 ## [1.1.0]
 
 ### Added — Issue Creation
