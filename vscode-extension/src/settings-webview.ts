@@ -1,6 +1,22 @@
 import * as vscode from "vscode";
+import * as os from "os";
+import * as path from "path";
 import axios from "axios";
-import { listProjects, listStatuses, listProjectMembers, listTrackers, configureClient } from "./redmine-client";
+import { listProjects, listStatuses, listProjectMembers, listTrackers, listIssues, getIssue, configureClient } from "./redmine-client";
+import type { TrackerFieldCacheEntry } from "./extension";
+
+export interface CustomFieldDef {
+  id: number;
+  name: string;
+  type: "text" | "select";
+  options: string[];
+}
+
+export interface CustomFieldConfigEntry {
+  trackerId: number;
+  trackerName: string;
+  fields: CustomFieldDef[];
+}
 
 export class SettingsWebview {
   private panel: vscode.WebviewPanel | null = null;
@@ -25,9 +41,9 @@ export class SettingsWebview {
       defaultAssigneeMode:  cfg.get<string>("defaultAssigneeMode") ?? "all",
       defaultAssigneeId:    cfg.get<string>("defaultAssigneeId") ?? "",
       defaultTrackerId:     cfg.get<string>("defaultTrackerId") ?? "",
-      bugFieldTypeBugId:    cfg.get<string>("bugFieldTypeBugId") ?? "",
-      bugFieldFoundInId:    cfg.get<string>("bugFieldFoundInId") ?? "",
-      bugFieldRootCauseId:  cfg.get<string>("bugFieldRootCauseId") ?? "",
+      testCaseTemplate:     cfg.get<Record<string, unknown>>("testCaseTemplate") ?? {},
+      issueDetectInclude:   cfg.get<string[]>("issueDetection.include") ?? ["NG", "Fail"],
+      issueDetectExclude:   cfg.get<string[]>("issueDetection.exclude") ?? [],
     };
 
     // Pre-fetch lookup data before building the webview
@@ -52,18 +68,30 @@ export class SettingsWebview {
       } catch { /* show empty — user can reload */ }
     }
 
+    // Load custom field data from global state
+    const trackerFieldCache = this.context.globalState.get<TrackerFieldCacheEntry[]>("trackerFieldCache") ?? [];
+    const customFieldConfig = this.context.globalState.get<CustomFieldConfigEntry[]>("customFieldConfig") ?? [];
+
     this.panel = vscode.window.createWebviewPanel(
       "redmineSettings", "Redmine — Settings",
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    this.panel.onDidDispose(() => { this.panel = null; });
+    // Refresh template view when config changes (e.g. user saves template from test case webview)
+    const cfgSub = vscode.workspace.onDidChangeConfiguration((evt) => {
+      if (!this.panel) return;
+      if (evt.affectsConfiguration("redmine.testCaseTemplate")) {
+        const latest = vscode.workspace.getConfiguration("redmine").get<Record<string, unknown>>("testCaseTemplate") ?? {};
+        this.panel.webview.postMessage({ command: "templateSaved", template: latest });
+      }
+    });
+    this.panel.onDidDispose(() => { cfgSub.dispose(); this.panel = null; });
 
     const logoUri = this.panel.webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, "resources", "redmine.png")
     );
 
-    this.panel.webview.html = buildHtml(init, projects, statuses, members, trackers, logoUri.toString());
+    this.panel.webview.html = buildHtml(init, projects, statuses, members, trackers, logoUri.toString(), trackerFieldCache, customFieldConfig);
 
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       if (msg.command === "openFeedback") {
@@ -87,9 +115,6 @@ export class SettingsWebview {
         await c.update("defaultAssigneeName",   msg.defaultAssigneeName ?? "",                    vscode.ConfigurationTarget.Global);
         await c.update("defaultTrackerId",      msg.defaultTrackerId ?? "",                        vscode.ConfigurationTarget.Global);
         await c.update("defaultTrackerName",    msg.defaultTrackerName ?? "",                      vscode.ConfigurationTarget.Global);
-        await c.update("bugFieldTypeBugId",     (msg.bugFieldTypeBugId as string ?? "").trim(),    vscode.ConfigurationTarget.Global);
-        await c.update("bugFieldFoundInId",     (msg.bugFieldFoundInId as string ?? "").trim(),    vscode.ConfigurationTarget.Global);
-        await c.update("bugFieldRootCauseId",   (msg.bugFieldRootCauseId as string ?? "").trim(),  vscode.ConfigurationTarget.Global);
         this.panel?.webview.postMessage({ command: "saved" });
         vscode.commands.executeCommand("redmine.refresh");
       }
@@ -164,6 +189,284 @@ export class SettingsWebview {
           this.panel?.webview.postMessage({ command: "membersResult", members: [] });
         }
       }
+
+      // ── Save test case template ───────────────────────────────────────
+      if (msg.command === "saveTemplate") {
+        const c = vscode.workspace.getConfiguration("redmine");
+        await c.update("testCaseTemplate", msg.template ?? {}, vscode.ConfigurationTarget.Global);
+        this.panel?.webview.postMessage({ command: "templateSaved" });
+      }
+
+      // ── Save issue detection keywords ─────────────────────────────────
+      if (msg.command === "saveIssueDetection") {
+        const include = Array.isArray(msg.include) ? msg.include.filter((s: unknown) => typeof s === "string" && s.trim() !== "") : [];
+        const exclude = Array.isArray(msg.exclude) ? msg.exclude.filter((s: unknown) => typeof s === "string" && s.trim() !== "") : [];
+        const c = vscode.workspace.getConfiguration("redmine");
+        await c.update("issueDetection.include", include, vscode.ConfigurationTarget.Global);
+        await c.update("issueDetection.exclude", exclude, vscode.ConfigurationTarget.Global);
+        this.panel?.webview.postMessage({ command: "issueDetectionSaved" });
+      }
+
+      // ── Clear test case template ──────────────────────────────────────
+      if (msg.command === "clearTemplate") {
+        const c = vscode.workspace.getConfiguration("redmine");
+        const existing = c.get<Record<string, unknown>>("testCaseTemplate") ?? {};
+        if (Object.keys(existing).length === 0) {
+          vscode.window.showInformationMessage("Template is already empty.");
+          return;
+        }
+        const confirm = await vscode.window.showWarningMessage(
+          "This will delete your current test case template. Continue?",
+          { modal: true },
+          "Clear",
+        );
+        if (confirm !== "Clear") return;
+        await c.update("testCaseTemplate", {}, vscode.ConfigurationTarget.Global);
+        // onDidChangeConfiguration listener re-renders the display automatically
+        vscode.window.showInformationMessage("✓ Template cleared.");
+      }
+
+      // ── Save custom field config ──────────────────────────────────────
+      if (msg.command === "saveCustomFieldConfig") {
+        const config = msg.config as CustomFieldConfigEntry[];
+        await this.context.globalState.update("customFieldConfig", config);
+        this.panel?.webview.postMessage({ command: "customFieldConfigSaved", silent: !!msg.silent });
+      }
+
+      // ── Re-fetch custom fields from Redmine ───────────────────────────
+      if (msg.command === "refetchCustomFields") {
+        try {
+          const cfg = vscode.workspace.getConfiguration("redmine");
+          const projectId = cfg.get<string>("defaultProject") || undefined;
+          const trackers = await listTrackers();
+
+          // Reset cache — force re-fetch all
+          await this.context.globalState.update("trackerFieldCache", []);
+          const newCache: TrackerFieldCacheEntry[] = [];
+
+          for (const tracker of trackers) {
+            try {
+              const result = await listIssues({ trackerId: String(tracker.id), projectId, limit: 1 });
+              const fields = result.issues.length
+                ? (await getIssue(result.issues[0].id)).custom_fields?.map((cf) => ({ id: cf.id, name: cf.name })) ?? []
+                : [];
+              newCache.push({ trackerId: tracker.id, trackerName: tracker.name, fields, fetched: true });
+            } catch { newCache.push({ trackerId: tracker.id, trackerName: tracker.name, fields: [], fetched: true }); }
+          }
+
+          await this.context.globalState.update("trackerFieldCache", newCache);
+
+          // Backward compat
+          const bugEntry = newCache.find((e) => /^bug$/i.test(e.trackerName));
+          if (bugEntry) {
+            await this.context.globalState.update("bugIssueExists", bugEntry.fields.length > 0);
+            await this.context.globalState.update("bugCustomFieldDefs", bugEntry.fields);
+          }
+
+          this.panel?.webview.postMessage({ command: "refetchResult", cache: newCache });
+        } catch (err) {
+          this.panel?.webview.postMessage({ command: "refetchError", message: String(err) });
+        }
+      }
+
+      // ── Export custom field config ────────────────────────────────────
+      if (msg.command === "exportCustomFields") {
+        const config = this.context.globalState.get<CustomFieldConfigEntry[]>("customFieldConfig") ?? [];
+        if (config.length === 0) {
+          vscode.window.showWarningMessage("No custom field configuration to export.");
+          return;
+        }
+        const today = new Date().toISOString().slice(0, 10);
+        const defaultDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
+        const uri = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file(path.join(defaultDir, `redmine-custom-fields-${today}.json`)),
+          filters: { "JSON": ["json"] },
+          saveLabel: "Export",
+        });
+        if (!uri) return;
+        const payload = {
+          version: 1,
+          kind: "redmine-connector.customFieldConfig",
+          exportedAt: new Date().toISOString(),
+          customFieldConfig: config,
+        };
+        try {
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(payload, null, 2), "utf8"));
+          const fieldCount = config.reduce((sum, t) => sum + t.fields.length, 0);
+          vscode.window.showInformationMessage(`✓ Exported ${config.length} tracker(s), ${fieldCount} field(s) → ${uri.fsPath}`);
+        } catch (err) {
+          vscode.window.showErrorMessage(`Export failed: ${String(err)}`);
+        }
+      }
+
+      // ── Import custom field config ────────────────────────────────────
+      if (msg.command === "importCustomFields") {
+        const uris = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          filters: { "JSON": ["json"] },
+          openLabel: "Import",
+        });
+        if (!uris || uris.length === 0) return;
+
+        let parsed: { customFieldConfig?: CustomFieldConfigEntry[] } | CustomFieldConfigEntry[];
+        try {
+          const buf = await vscode.workspace.fs.readFile(uris[0]);
+          parsed = JSON.parse(Buffer.from(buf).toString("utf8"));
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to read file: ${String(err)}`);
+          return;
+        }
+
+        const imported = Array.isArray(parsed)
+          ? parsed
+          : (parsed?.customFieldConfig ?? []);
+
+        if (!Array.isArray(imported) || imported.length === 0) {
+          vscode.window.showErrorMessage("Invalid file: no customFieldConfig found.");
+          return;
+        }
+
+        const cache = this.context.globalState.get<TrackerFieldCacheEntry[]>("trackerFieldCache") ?? [];
+        if (cache.length === 0) {
+          vscode.window.showWarningMessage(
+            "No tracker data found. Click 'Refresh from Redmine' first so the importer can match by name.",
+          );
+          return;
+        }
+
+        const confirm = await vscode.window.showWarningMessage(
+          "This will REPLACE your current Custom Fields configuration. Fields are matched by tracker name + field name; entries not found in your Redmine will be skipped. Continue?",
+          { modal: true },
+          "Import",
+        );
+        if (confirm !== "Import") return;
+
+        let matched = 0;
+        let skipped = 0;
+        const next: CustomFieldConfigEntry[] = [];
+
+        for (const impTracker of imported) {
+          if (!impTracker || typeof impTracker !== "object") continue;
+          const localTracker = cache.find((t) => t.trackerName === impTracker.trackerName);
+          if (!localTracker) {
+            skipped += (impTracker.fields ?? []).length || 1;
+            continue;
+          }
+          const entry: CustomFieldConfigEntry = {
+            trackerId: localTracker.trackerId,
+            trackerName: localTracker.trackerName,
+            fields: [],
+          };
+          for (const impField of impTracker.fields ?? []) {
+            const localField = localTracker.fields.find((f) => f.name === impField.name);
+            if (!localField) { skipped++; continue; }
+            entry.fields.push({
+              id: localField.id,
+              name: localField.name,
+              type: impField.type === "select" ? "select" : "text",
+              options: Array.isArray(impField.options) ? impField.options.filter((s: unknown) => typeof s === "string") : [],
+            });
+            matched++;
+          }
+          if (entry.fields.length > 0) next.push(entry);
+        }
+
+        await this.context.globalState.update("customFieldConfig", next);
+        this.panel?.webview.postMessage({ command: "importResult", success: true, matched, skipped, config: next });
+
+        const summary = `Imported ${matched} field(s)` + (skipped ? `, ${skipped} skipped (not found in your Redmine)` : "");
+        vscode.window.showInformationMessage(`✓ ${summary}`);
+      }
+
+      // ── Export test case template ─────────────────────────────────────
+      if (msg.command === "exportTemplate") {
+        const cfg = vscode.workspace.getConfiguration("redmine");
+        const template = cfg.get<Record<string, unknown>>("testCaseTemplate") ?? {};
+        if (Object.keys(template).length === 0) {
+          vscode.window.showWarningMessage("No template configured. Open a test case file and create a template first.");
+          return;
+        }
+        const today = new Date().toISOString().slice(0, 10);
+        const defaultDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
+        const uri = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file(path.join(defaultDir, `redmine-template-${today}.json`)),
+          filters: { "JSON": ["json"] },
+          saveLabel: "Export",
+        });
+        if (!uri) return;
+        const payload = {
+          version: 1,
+          kind: "redmine-connector.testCaseTemplate",
+          exportedAt: new Date().toISOString(),
+          template,
+        };
+        try {
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(payload, null, 2), "utf8"));
+          vscode.window.showInformationMessage(`✓ Template exported → ${uri.fsPath}`);
+        } catch (err) {
+          vscode.window.showErrorMessage(`Export failed: ${String(err)}`);
+        }
+      }
+
+      // ── Import test case template ─────────────────────────────────────
+      if (msg.command === "importTemplate") {
+        const uris = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          filters: { "JSON": ["json"] },
+          openLabel: "Import",
+        });
+        if (!uris || uris.length === 0) return;
+
+        let parsed: { template?: Record<string, unknown> } | Record<string, unknown>;
+        try {
+          const buf = await vscode.workspace.fs.readFile(uris[0]);
+          parsed = JSON.parse(Buffer.from(buf).toString("utf8"));
+        } catch (err) {
+          vscode.window.showErrorMessage(`Failed to read file: ${String(err)}`);
+          return;
+        }
+
+        // Accept either the wrapped envelope { template: {...} } or a bare template object
+        const imported = (parsed && typeof parsed === "object" && "template" in parsed && parsed.template)
+          ? parsed.template as Record<string, unknown>
+          : parsed as Record<string, unknown>;
+
+        if (!imported || typeof imported !== "object" || Array.isArray(imported)) {
+          vscode.window.showErrorMessage("Invalid template file.");
+          return;
+        }
+
+        const currentCfg = vscode.workspace.getConfiguration("redmine");
+        const hadExisting = Object.keys(currentCfg.get<Record<string, unknown>>("testCaseTemplate") ?? {}).length > 0;
+        if (hadExisting) {
+          const confirm = await vscode.window.showWarningMessage(
+            "This will REPLACE your current test case template. Continue?",
+            { modal: true },
+            "Import",
+          );
+          if (confirm !== "Import") return;
+        }
+
+        // Re-resolve trackerId by matching trackerName against the local cache
+        // (IDs differ between Redmine instances; tracker names are usually shared).
+        const cache = this.context.globalState.get<TrackerFieldCacheEntry[]>("trackerFieldCache") ?? [];
+        const trackerName = typeof imported.tracker === "string" ? imported.tracker : "";
+        const localTracker = trackerName ? cache.find((t) => t.trackerName === trackerName) : undefined;
+        const normalized: Record<string, unknown> = { ...imported };
+        if (localTracker) {
+          normalized.trackerId = localTracker.trackerId;
+        } else if (trackerName) {
+          // Keep the imported trackerId as a best-effort fallback
+          // but warn the user — the create-issue flow won't be able to resolve CFs.
+          vscode.window.showWarningMessage(
+            `Tracker "${trackerName}" not found in your Redmine. Click 'Refresh from Redmine' in the Custom Fields tab if you expected it to exist.`,
+          );
+        }
+
+        await currentCfg.update("testCaseTemplate", normalized, vscode.ConfigurationTarget.Global);
+        // Settings webview's existing onDidChangeConfiguration listener will re-render the display.
+        vscode.window.showInformationMessage("✓ Template imported.");
+      }
     });
   }
 }
@@ -179,13 +482,17 @@ function buildHtml(
     defaultStatusMode: string; defaultStatusIds: string[];
     defaultAssigneeMode: string; defaultAssigneeId: string;
     defaultTrackerId: string;
-    bugFieldTypeBugId: string; bugFieldFoundInId: string; bugFieldRootCauseId: string;
+    testCaseTemplate: Record<string, unknown>;
+    issueDetectInclude: string[];
+    issueDetectExclude: string[];
   },
   projects: { id: string; name: string }[],
   statuses: { id: string; name: string; is_closed: boolean }[],
   members:  { id: string; name: string }[],
   trackers: { id: string; name: string }[],
   logoSrc: string,
+  trackerFieldCache: TrackerFieldCacheEntry[],
+  customFieldConfig: CustomFieldConfigEntry[],
 ): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -259,21 +566,58 @@ function buildHtml(
   .feedback.error   { display: block; background: color-mix(in srgb,var(--vscode-errorForeground) 12%,transparent); border-left: 3px solid var(--vscode-errorForeground); color: var(--vscode-errorForeground); }
   .feedback.info    { display: block; background: color-mix(in srgb,var(--vscode-charts-blue) 10%,transparent); border-left: 3px solid var(--vscode-charts-blue); color: var(--vscode-foreground); }
   .divider { border: none; border-top: 1px solid var(--vscode-widget-border,#333); margin: 20px 0; }
+
+  /* Sticky top bar (header + tabs) */
+  .topbar { position: sticky; top: 0; z-index: 10; background: var(--vscode-editor-background); padding-top: 4px; margin-bottom: 24px; }
+  .topbar .header { margin-bottom: 16px; }
+  .topbar .tab-bar { margin-bottom: 0; }
+
+  /* Custom Fields tab */
+  details.tracker-block { border: 1px solid var(--vscode-widget-border,#444); border-radius: 6px; margin-bottom: 16px; overflow: hidden; }
+  details.tracker-block > summary { padding: 10px 14px; background: var(--vscode-editor-inactiveSelectionBackground); font-weight: 700; font-size: .9em; cursor: pointer; display: flex; align-items: center; gap: 8px; list-style: none; user-select: none; }
+  details.tracker-block > summary::-webkit-details-marker { display: none; }
+  details.tracker-block > summary::before { content: '▸'; font-size: .9em; transition: transform .15s; display: inline-block; }
+  details.tracker-block[open] > summary::before { transform: rotate(90deg); }
+  .tracker-name { flex: 1; }
+  .tracker-count { font-weight: 400; font-size: .82em; color: var(--vscode-descriptionForeground); }
+  .tracker-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+  .empty-tracker { padding: 12px 14px; font-size: .85em; color: var(--vscode-descriptionForeground); font-style: italic; }
+
+  .cf-field { border: 1px solid var(--vscode-widget-border,#333); border-radius: 4px; padding: 10px 12px; }
+  .cf-field-head { display: flex; align-items: center; gap: 12px; margin-bottom: 0; }
+  .cf-name { font-weight: 600; font-size: .9em; flex: 1; }
+  .cf-name small { font-family: monospace; font-size: .85em; color: var(--vscode-descriptionForeground); font-weight: 400; }
+  .cf-type-sel { width: auto !important; padding: 3px 8px !important; font-size: .85em !important; }
+  .cf-options { margin-top: 10px; padding: 10px 12px; background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; }
+  .cf-options-label { font-size: .8em; color: var(--vscode-descriptionForeground); display: block; margin-bottom: 7px; text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+  .cf-no-options { font-size: .82em; color: var(--vscode-descriptionForeground); font-style: italic; margin-bottom: 8px; }
+  .cf-option-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+  .cf-option-row { display: flex; gap: 6px; align-items: center; }
+  .cf-option-input { flex: 1; padding: 4px 8px !important; font-size: .85em !important; }
+  .cf-opt-remove { background: none; border: 1px solid var(--vscode-widget-border,#444); color: var(--vscode-descriptionForeground); border-radius: 3px; cursor: pointer; padding: 2px 8px; font-size: 1em; line-height: 1; height: 26px; }
+  .cf-opt-remove:hover { color: var(--vscode-errorForeground); border-color: var(--vscode-errorForeground); }
+  .cf-opt-add { background: none; border: 1px dashed var(--vscode-widget-border,#555); color: var(--vscode-textLink-foreground); border-radius: 3px; cursor: pointer; padding: 5px 12px; font-size: .82em; font-family: inherit; }
+  .cf-opt-add:hover { border-color: var(--vscode-textLink-foreground); background: color-mix(in srgb,var(--vscode-textLink-foreground) 8%,transparent); }
 </style>
 </head>
 <body>
 
-<div class="header">
-  <img src="${e(logoSrc)}" alt="Redmine">
-  <div class="header-text">
-    <div class="logo">Redmine Connector</div>
-    <div class="subtitle">Connection settings and default filter preferences</div>
+<div class="topbar">
+  <div class="header">
+    <img src="${e(logoSrc)}" alt="Redmine">
+    <div class="header-text">
+      <div class="logo">Redmine Connector</div>
+      <div class="subtitle">Connection settings and default filter preferences</div>
+    </div>
   </div>
-</div>
 
-<div class="tab-bar">
-  <button class="tab-btn active" onclick="switchTab('conn',this)">⚙ Connection</button>
-  <button class="tab-btn" onclick="switchTab('filters',this)">🔽 Default Filters</button>
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('conn',this)">⚙ Connection</button>
+    <button class="tab-btn" onclick="switchTab('filters',this)">🔽 Default Filters</button>
+    <button class="tab-btn" onclick="switchTab('customfields',this)">🔧 Custom Fields</button>
+    <button class="tab-btn" onclick="switchTab('detection',this)">🎯 Issue Detection</button>
+    <button class="tab-btn" onclick="switchTab('template',this)">📋 Test Case Template</button>
+  </div>
 </div>
 
 <!-- TAB: Connection -->
@@ -371,32 +715,97 @@ function buildHtml(
   </div>
 
   <hr class="divider">
-
-  <div class="section">
-    <div class="section-title">Bug Tracker — Custom Field IDs</div>
-    <div class="hint" style="margin-bottom:10px">Enter the numeric IDs for required Bug fields. Find them in Redmine → Administration → Custom Fields (check the URL or ID column). If you leave these empty, the extension infers IDs from issues already loaded in the sidebar or from the first Bug returned by Redmine (no admin API).</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
-      <div>
-        <label class="field-label" style="display:block;margin-bottom:4px;font-size:.84em;font-weight:600">Type Bug ID</label>
-        <input type="text" id="bugFieldTypeBugId" value="${e(init.bugFieldTypeBugId)}" placeholder="e.g. 5" style="width:100%">
-      </div>
-      <div>
-        <label class="field-label" style="display:block;margin-bottom:4px;font-size:.84em;font-weight:600">Found In ID</label>
-        <input type="text" id="bugFieldFoundInId" value="${e(init.bugFieldFoundInId)}" placeholder="e.g. 6" style="width:100%">
-      </div>
-      <div>
-        <label class="field-label" style="display:block;margin-bottom:4px;font-size:.84em;font-weight:600">Root Cause ID</label>
-        <input type="text" id="bugFieldRootCauseId" value="${e(init.bugFieldRootCauseId)}" placeholder="e.g. 7" style="width:100%">
-      </div>
-    </div>
-  </div>
-
-  <hr class="divider">
   <div class="btn-row">
     <button class="btn" onclick="save()">💾 Save Settings</button>
     <button class="btn btn-sec btn-sm" onclick="reloadAll()">🔄 Reload from Redmine</button>
   </div>
   <div class="feedback" id="saveFb2"></div>
+</div>
+
+<!-- TAB: Custom Fields -->
+<div class="tab-pane" id="tab-customfields">
+  <div class="section">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div>
+        <div class="section-title">Custom Fields per Tracker</div>
+        <div class="hint" style="margin-top:4px">Discovered from existing issues. Set type and options for each field.</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+        <button class="btn btn-sec btn-sm" onclick="refetchCustomFields()" id="btnRefetch">🔄 Refresh</button>
+        <button class="btn btn-sec btn-sm" onclick="exportCustomFields()">📤 Export</button>
+        <button class="btn btn-sec btn-sm" onclick="importCustomFields()">📥 Import</button>
+      </div>
+    </div>
+
+    <div class="feedback" id="cfFb"></div>
+    <div id="cfContent"></div>
+
+    <div class="btn-row" style="margin-top:20px">
+      <button class="btn" onclick="saveCustomFieldConfig()">💾 Save Custom Fields</button>
+    </div>
+  </div>
+</div>
+
+<!-- TAB: Issue Detection -->
+<div class="tab-pane" id="tab-detection">
+  <div class="section">
+    <div class="section-title">Auto-Detect Failing Test Cases</div>
+    <div class="hint" style="margin-bottom:16px">Configure which <strong>Status QC</strong> values mark a test case row as a failure. Rows that match show the <strong>Create Issue</strong> button.<br>Matching is <strong>case-insensitive substring</strong>: <code>NG</code> matches both <code>NG</code> and <code>NG (re-check)</code>.</div>
+
+    <div class="feedback" id="detectFb"></div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px">
+      <!-- Include list -->
+      <div style="border:1px solid var(--vscode-widget-border,#444);border-radius:6px;padding:14px">
+        <div style="font-weight:700;font-size:.9em;margin-bottom:4px;color:var(--vscode-testing-iconFailed,#f48771)">✓ Include</div>
+        <div class="hint" style="margin-bottom:10px">Treated as failure if the Status QC contains any keyword here.</div>
+        <div id="detectIncludeList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="detectIncludeInput" placeholder="e.g. NG" onkeydown="onDetectInputKey(event,'include')" style="flex:1;padding:5px 8px;font-size:.85em">
+          <button class="btn btn-sec btn-sm" onclick="addDetectKeyword('include')">+ Add</button>
+        </div>
+      </div>
+
+      <!-- Exclude list -->
+      <div style="border:1px solid var(--vscode-widget-border,#444);border-radius:6px;padding:14px">
+        <div style="font-weight:700;font-size:.9em;margin-bottom:4px;color:var(--vscode-charts-blue,#4ec9b0)">✗ Exclude (veto)</div>
+        <div class="hint" style="margin-bottom:10px">Rows matching any of these are NEVER treated as failure, even if they also match Include. Example: <code>test NG</code>.</div>
+        <div id="detectExcludeList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="detectExcludeInput" placeholder="e.g. test NG" onkeydown="onDetectInputKey(event,'exclude')" style="flex:1;padding:5px 8px;font-size:.85em">
+          <button class="btn btn-sec btn-sm" onclick="addDetectKeyword('exclude')">+ Add</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="btn-row" style="margin-top:20px">
+      <button class="btn" onclick="saveDetection()">💾 Save Detection Rules</button>
+      <button class="btn btn-sec btn-sm" onclick="resetDetection()">↺ Reset to defaults</button>
+    </div>
+  </div>
+</div>
+
+<!-- TAB: Test Case Template -->
+<div class="tab-pane" id="tab-template">
+  <div class="section">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px">
+      <div style="flex:1">
+        <div class="section-title">Test Case → Issue Template</div>
+        <div class="hint" style="margin-top:4px">View the template that defines how test case columns map to issue fields. To edit or create a template, open a test case file and use the <strong>Create Template</strong> button at the top.</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+        <button class="btn btn-sec btn-sm" onclick="exportTemplate()">📤 Export</button>
+        <button class="btn btn-sec btn-sm" onclick="importTemplate()">📥 Import</button>
+        <button class="btn btn-sec btn-sm" onclick="clearTemplate()">🗑 Clear</button>
+      </div>
+    </div>
+
+    <div class="feedback" id="tplFb"></div>
+
+    <div id="templateDisplay" style="padding:16px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px;border:1px solid var(--vscode-widget-border,#444)">
+      <div style="color:var(--vscode-descriptionForeground);font-size:.9em">No template configured yet.</div>
+    </div>
+  </div>
 </div>
 
 <!-- Feedback footer (always visible) -->
@@ -418,14 +827,26 @@ function buildHtml(
   const INIT_AM   = ${JSON.stringify(init.defaultAssigneeMode)};
   const INIT_AID  = ${JSON.stringify(init.defaultAssigneeId)};
   const INIT_TID  = ${JSON.stringify(init.defaultTrackerId)};
+  const INIT_TPL  = ${JSON.stringify(init.testCaseTemplate)};
+  const TRACKER_FIELD_CACHE = ${JSON.stringify(trackerFieldCache)};
+  const CUSTOM_FIELD_CONFIG = ${JSON.stringify(customFieldConfig)};
+  const INIT_DETECT_INC = ${JSON.stringify(init.issueDetectInclude)};
+  const INIT_DETECT_EXC = ${JSON.stringify(init.issueDetectExclude)};
 
   let _membersLoaded = MEMBERS.length > 0;
+  let _cfConfig = JSON.parse(JSON.stringify(CUSTOM_FIELD_CONFIG)); // deep copy
+
+  let _detectInc = (INIT_DETECT_INC || []).slice();
+  let _detectExc = (INIT_DETECT_EXC || []).slice();
 
   // Render immediately on load
   renderProjects(PROJECTS);
   renderStatuses(STATUSES);
   renderMembers(MEMBERS, INIT_AID);
   renderTrackers(TRACKERS);
+  renderTemplate(INIT_TPL);
+  renderCustomFields(TRACKER_FIELD_CACHE, _cfConfig);
+  renderDetectionLists();
 
   // ── Tab switching ──────────────────────────────────────────────────────────
   function switchTab(name, btn) {
@@ -441,6 +862,10 @@ function buildHtml(
     const inp = document.getElementById('apiKey');
     inp.type = inp.type === 'password' ? 'text' : 'password';
     ev.currentTarget.textContent = inp.type === 'password' ? 'show' : 'hide';
+  }
+
+  function escAttr(s) {
+    return (s == null ? '' : String(s)).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   // ── Render helpers ──────────────────────────────────────────────────────────
@@ -484,6 +909,289 @@ function buildHtml(
       if (t.id === currentVal) o.selected = true;
       sel.appendChild(o);
     });
+  }
+
+  function renderTemplate(template) {
+    const display = document.getElementById('templateDisplay');
+    if (!template || Object.keys(template).length === 0) {
+      display.innerHTML = '<div style="color:var(--vscode-descriptionForeground);font-size:.9em">No template configured yet. Open a test case file and click <strong>Create Template</strong> to get started.</div>';
+      return;
+    }
+    const codeStyle = 'font-family:monospace;background:var(--vscode-textCodeBlock-background);padding:2px 6px;border-radius:3px;white-space:pre-wrap;word-break:break-word';
+    const rowStyle  = 'display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:start;margin-bottom:10px;font-size:.9em';
+    function row(label, valueHtml) {
+      return '<div style="' + rowStyle + '"><strong>' + label + '</strong><div>' + valueHtml + '</div></div>';
+    }
+    function codeVal(v) { return '<code style="' + codeStyle + '">' + escAttr(v) + '</code>'; }
+
+    let html = '';
+    if (template.subject)           html += row('Subject',     codeVal(template.subject));
+    if (template.description)       html += row('Description', codeVal(String(template.description).replace(/\\n/g, ' ↵ ')));
+    if (template.tracker)           html += row('Tracker',     escAttr(template.tracker));
+    if (template.status)            html += row('Status',      escAttr(template.status));
+    if (template.attachmentPattern) html += row('Attachments', escAttr(template.attachmentPattern));
+
+    const cf = template.customFields || {};
+    const cfKeys = Object.keys(cf);
+    if (cfKeys.length > 0) {
+      let cfHtml = '<div style="display:flex;flex-direction:column;gap:6px">';
+      cfKeys.forEach(function(name) {
+        const val = cf[name] || '';
+        cfHtml += '<div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center">'
+          + '<span style="font-size:.85em;color:var(--vscode-descriptionForeground)">' + escAttr(name) + '</span>'
+          + (val ? codeVal(val) : '<span style="color:var(--vscode-descriptionForeground);font-style:italic;font-size:.85em">(empty)</span>')
+          + '</div>';
+      });
+      cfHtml += '</div>';
+      html += row('Custom Fields', cfHtml);
+    }
+
+    if (!html) {
+      display.innerHTML = '<div style="color:var(--vscode-descriptionForeground);font-size:.9em">Template is empty.</div>';
+      return;
+    }
+    display.innerHTML = html;
+  }
+
+  // ── Custom Fields ──────────────────────────────────────────────────────────
+  function renderCustomFields(cache, config) {
+    const el = document.getElementById('cfContent');
+    if (!cache || cache.length === 0) {
+      el.innerHTML = '<div style="color:var(--vscode-descriptionForeground);font-size:.9em;padding:16px 0">No tracker data found. Make sure Redmine is connected, then click <strong>Refresh from Redmine</strong>.</div>';
+      return;
+    }
+    // Sort: trackers with custom fields first, empty ones at bottom
+    const sorted = cache.slice().sort(function(a, b) {
+      const ae = (a.fields || []).length === 0 ? 1 : 0;
+      const be = (b.fields || []).length === 0 ? 1 : 0;
+      return ae - be;
+    });
+
+    let html = '';
+    sorted.forEach(function(tracker) {
+      const hasFields = (tracker.fields || []).length > 0;
+      html += '<details class="tracker-block"' + (hasFields ? ' open' : '') + ' data-tracker="' + tracker.trackerId + '">';
+      html += '<summary>';
+      html += '<span class="tracker-name">' + escAttr(tracker.trackerName) + '</span>';
+      html += '<span class="tracker-count">' + (hasFields ? (tracker.fields.length + ' field' + (tracker.fields.length > 1 ? 's' : '')) : 'no custom fields') + '</span>';
+      html += '</summary>';
+
+      if (!hasFields) {
+        html += '<div class="empty-tracker">No custom fields discovered for this tracker.</div>';
+      } else {
+        html += '<div class="tracker-body">';
+        tracker.fields.forEach(function(field) {
+          html += renderCfField(tracker.trackerId, field);
+        });
+        html += '</div>';
+      }
+      html += '</details>';
+    });
+    el.innerHTML = html;
+  }
+
+  function renderCfField(trackerId, field) {
+    const cfg = getCfgField(trackerId, field.id) || { id: field.id, name: field.name, type: 'text', options: [] };
+    const isSelect = cfg.type === 'select';
+    let html = '<div class="cf-field" data-tracker="' + trackerId + '" data-field="' + field.id + '">';
+    html += '<div class="cf-field-head">';
+    html += '<div class="cf-name">' + escAttr(field.name) + ' <small>(ID: ' + field.id + ')</small></div>';
+    html += '<label style="font-size:.85em">Type:</label>';
+    html += '<select class="cf-type-sel" onchange="onCfTypeChange(this,' + trackerId + ',' + field.id + ')">';
+    html += '<option value="text"' + (isSelect ? '' : ' selected') + '>Text input</option>';
+    html += '<option value="select"' + (isSelect ? ' selected' : '') + '>Select (dropdown)</option>';
+    html += '</select>';
+    html += '</div>';
+    html += '<div class="cf-options" data-options-for="' + trackerId + '_' + field.id + '" style="display:' + (isSelect ? 'block' : 'none') + '">';
+    html += renderCfOptions(trackerId, field.id, cfg.options || []);
+    html += '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  function renderCfOptions(trackerId, fieldId, options) {
+    let html = '<label class="cf-options-label">Options</label>';
+    if (!options || options.length === 0) {
+      html += '<div class="cf-no-options">No options yet.</div>';
+    } else {
+      html += '<div class="cf-option-list">';
+      options.forEach(function(opt, idx) {
+        html += '<div class="cf-option-row">';
+        html += '<input type="text" class="cf-option-input" value="' + escAttr(opt) + '" placeholder="Option value" oninput="onCfOptionInput(this,' + trackerId + ',' + fieldId + ',' + idx + ')">';
+        html += '<button class="cf-opt-remove" onclick="removeCfOption(' + trackerId + ',' + fieldId + ',' + idx + ')" title="Remove option">×</button>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    html += '<button class="cf-opt-add" onclick="addCfOption(' + trackerId + ',' + fieldId + ')">+ Add option</button>';
+    return html;
+  }
+
+  function rerenderCfOptions(trackerId, fieldId) {
+    const cfg = getCfgField(trackerId, fieldId);
+    const wrap = document.querySelector('.cf-options[data-options-for="' + trackerId + '_' + fieldId + '"]');
+    if (wrap && cfg) wrap.innerHTML = renderCfOptions(trackerId, fieldId, cfg.options || []);
+  }
+
+  // ── _cfConfig accessors ────────────────────────────────────────────────────
+  function getCfgField(trackerId, fieldId) {
+    const entry = _cfConfig.find(function(c) { return c.trackerId === trackerId; });
+    if (!entry) return null;
+    return entry.fields.find(function(f) { return f.id === fieldId; }) || null;
+  }
+
+  function ensureCfgField(trackerId, fieldId) {
+    const tracker = TRACKER_FIELD_CACHE.find(function(t) { return t.trackerId === trackerId; });
+    if (!tracker) return null;
+    const fieldDef = (tracker.fields || []).find(function(f) { return f.id === fieldId; });
+    if (!fieldDef) return null;
+    let entry = _cfConfig.find(function(c) { return c.trackerId === trackerId; });
+    if (!entry) {
+      entry = { trackerId: trackerId, trackerName: tracker.trackerName, fields: [] };
+      _cfConfig.push(entry);
+    }
+    let cfg = entry.fields.find(function(f) { return f.id === fieldId; });
+    if (!cfg) {
+      cfg = { id: fieldId, name: fieldDef.name, type: 'text', options: [] };
+      entry.fields.push(cfg);
+    }
+    return cfg;
+  }
+
+  function commitCfConfig(silent) {
+    vscode.postMessage({ command: 'saveCustomFieldConfig', config: _cfConfig, silent: !!silent });
+  }
+
+  // ── Type change → auto-save ────────────────────────────────────────────────
+  function onCfTypeChange(sel, trackerId, fieldId) {
+    const cfg = ensureCfgField(trackerId, fieldId);
+    if (!cfg) return;
+    cfg.type = sel.value;
+    const optionsWrap = document.querySelector('.cf-options[data-options-for="' + trackerId + '_' + fieldId + '"]');
+    if (optionsWrap) optionsWrap.style.display = sel.value === 'select' ? 'block' : 'none';
+    commitCfConfig(true); // silent auto-save
+  }
+
+  // ── Option add / remove / edit ────────────────────────────────────────────
+  function addCfOption(trackerId, fieldId) {
+    const cfg = ensureCfgField(trackerId, fieldId);
+    if (!cfg) return;
+    if (!cfg.options) cfg.options = [];
+    cfg.options.push('');
+    rerenderCfOptions(trackerId, fieldId);
+    // Focus the newly added input
+    const wrap = document.querySelector('.cf-options[data-options-for="' + trackerId + '_' + fieldId + '"]');
+    if (wrap) {
+      const inputs = wrap.querySelectorAll('.cf-option-input');
+      if (inputs.length) inputs[inputs.length - 1].focus();
+    }
+  }
+
+  function removeCfOption(trackerId, fieldId, idx) {
+    const cfg = getCfgField(trackerId, fieldId);
+    if (!cfg || !cfg.options) return;
+    cfg.options.splice(idx, 1);
+    rerenderCfOptions(trackerId, fieldId);
+  }
+
+  function onCfOptionInput(inp, trackerId, fieldId, idx) {
+    const cfg = ensureCfgField(trackerId, fieldId);
+    if (!cfg || !cfg.options) return;
+    cfg.options[idx] = inp.value;
+  }
+
+  function saveCustomFieldConfig() {
+    // Trim empty option strings and persist
+    _cfConfig.forEach(function(entry) {
+      entry.fields.forEach(function(f) {
+        if (f.options) f.options = f.options.map(function(s) { return (s || '').trim(); }).filter(Boolean);
+      });
+    });
+    commitCfConfig(false);
+    renderCustomFields(TRACKER_FIELD_CACHE, _cfConfig);
+  }
+
+  function refetchCustomFields() {
+    document.getElementById('btnRefetch').disabled = true;
+    showFb('cfFb', 'info', 'Fetching custom fields from Redmine...');
+    vscode.postMessage({ command: 'refetchCustomFields' });
+  }
+
+  function exportCustomFields() {
+    vscode.postMessage({ command: 'exportCustomFields' });
+  }
+
+  function importCustomFields() {
+    vscode.postMessage({ command: 'importCustomFields' });
+  }
+
+  function exportTemplate() {
+    vscode.postMessage({ command: 'exportTemplate' });
+  }
+
+  function importTemplate() {
+    vscode.postMessage({ command: 'importTemplate' });
+  }
+
+  function clearTemplate() {
+    vscode.postMessage({ command: 'clearTemplate' });
+  }
+
+  // ── Issue Detection ────────────────────────────────────────────────────────
+  function renderDetectionLists() {
+    renderDetectChips('include', _detectInc, 'detectIncludeList');
+    renderDetectChips('exclude', _detectExc, 'detectExcludeList');
+  }
+
+  function renderDetectChips(kind, list, elId) {
+    const el = document.getElementById(elId);
+    if (list.length === 0) {
+      el.innerHTML = '<div style="font-size:.82em;color:var(--vscode-descriptionForeground);font-style:italic">(empty)</div>';
+      return;
+    }
+    el.innerHTML = list.map(function(kw, idx) {
+      return '<div style="display:flex;align-items:center;gap:6px">'
+        + '<code style="flex:1;font-family:monospace;background:var(--vscode-textCodeBlock-background);padding:4px 8px;border-radius:3px;font-size:.85em">' + escAttr(kw) + '</code>'
+        + '<button class="btn btn-sec btn-sm" onclick="removeDetectKeyword(\\'' + kind + '\\',' + idx + ')" title="Remove" style="padding:2px 8px;line-height:1">×</button>'
+        + '</div>';
+    }).join('');
+  }
+
+  function addDetectKeyword(kind) {
+    const inp = document.getElementById(kind === 'include' ? 'detectIncludeInput' : 'detectExcludeInput');
+    const val = (inp.value || '').trim();
+    if (!val) return;
+    const list = kind === 'include' ? _detectInc : _detectExc;
+    if (list.some(function(k) { return k.toLowerCase() === val.toLowerCase(); })) {
+      showFb('detectFb', 'error', 'Keyword "' + val + '" already exists in ' + kind + ' list.');
+      return;
+    }
+    list.push(val);
+    inp.value = '';
+    renderDetectionLists();
+    inp.focus();
+  }
+
+  function removeDetectKeyword(kind, idx) {
+    const list = kind === 'include' ? _detectInc : _detectExc;
+    list.splice(idx, 1);
+    renderDetectionLists();
+  }
+
+  function onDetectInputKey(ev, kind) {
+    if (ev.key === 'Enter') { ev.preventDefault(); addDetectKeyword(kind); }
+  }
+
+  function saveDetection() {
+    vscode.postMessage({ command: 'saveIssueDetection', include: _detectInc, exclude: _detectExc });
+  }
+
+  function resetDetection() {
+    if (!confirm('Reset detection rules to defaults (Include: NG, Fail; Exclude: empty)?')) return;
+    _detectInc = ['NG', 'Fail'];
+    _detectExc = [];
+    renderDetectionLists();
+    saveDetection();
   }
 
   function renderMembers(list, selectedId) {
@@ -581,13 +1289,30 @@ function buildHtml(
       defaultAssigneeName:  assigneeName,
       defaultTrackerId:     trackerId,
       defaultTrackerName:   trackerName,
-      bugFieldTypeBugId:    val('bugFieldTypeBugId'),
-      bugFieldFoundInId:    val('bugFieldFoundInId'),
-      bugFieldRootCauseId:  val('bugFieldRootCauseId'),
     });
   }
 
   function val(id) { return document.getElementById(id)?.value ?? ''; }
+
+  // ── Test Case Template ─────────────────────────────────────────────────────
+  function saveTemplate() {
+    const template = {
+      subject:    val('tmpl_subject'),
+      description: val('tmpl_description'),
+      tracker:    val('tmpl_tracker'),
+      status:     val('tmpl_status'),
+      assignee:   val('tmpl_assignee'),
+      priority:   val('tmpl_priority'),
+      dueDate:    val('tmpl_dueDate'),
+      attachment: val('tmpl_attachment'),
+    };
+    vscode.postMessage({ command: 'saveTemplate', template });
+  }
+
+  function clearTemplate() {
+    if (!confirm('Clear template? You can rebuild it anytime.')) return;
+    vscode.postMessage({ command: 'saveTemplate', template: {} });
+  }
 
   function showFb(id, type, msg) {
     const el = document.getElementById(id);
@@ -609,6 +1334,41 @@ function buildHtml(
       renderMembers(msg.members, INIT_AID);
       if (msg.trackers) renderTrackers(msg.trackers);
       showFb('reloadFb', 'success', '✓ Updated from Redmine.');
+    }
+
+    if (msg.command === 'templateSaved') {
+      renderTemplate(msg.template);
+    }
+
+    if (msg.command === 'customFieldConfigSaved') {
+      if (!msg.silent) {
+        showFb('cfFb', 'success', '✓ Custom field configuration saved.');
+        setTimeout(() => { const el = document.getElementById('cfFb'); if (el) el.style.display = 'none'; }, 2500);
+      }
+    }
+
+    if (msg.command === 'refetchResult') {
+      document.getElementById('btnRefetch').disabled = false;
+      renderCustomFields(msg.cache, _cfConfig);
+      showFb('cfFb', 'success', '✓ Custom fields refreshed from Redmine.');
+    }
+
+    if (msg.command === 'importResult' && msg.success) {
+      _cfConfig = msg.config || [];
+      renderCustomFields(TRACKER_FIELD_CACHE, _cfConfig);
+      const summary = '✓ Imported ' + (msg.matched || 0) + ' field(s)' + (msg.skipped ? ', ' + msg.skipped + ' skipped' : '') + '.';
+      showFb('cfFb', 'success', summary);
+      setTimeout(() => { const el = document.getElementById('cfFb'); if (el) el.style.display = 'none'; }, 5000);
+    }
+
+    if (msg.command === 'issueDetectionSaved') {
+      showFb('detectFb', 'success', '✓ Detection rules saved.');
+      setTimeout(() => { const el = document.getElementById('detectFb'); if (el) el.style.display = 'none'; }, 2500);
+    }
+
+    if (msg.command === 'refetchError') {
+      document.getElementById('btnRefetch').disabled = false;
+      showFb('cfFb', 'error', 'Failed to refresh: ' + msg.message);
     }
 
     if (msg.command === 'reloadError') {

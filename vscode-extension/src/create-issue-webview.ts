@@ -1,13 +1,10 @@
 import * as vscode from "vscode";
-import type { IssueProvider } from "./issue-provider";
 import {
   listProjects,
   listTrackers,
   listStatuses,
   listPriorities,
   listProjectMembers,
-  resolveBugCustomFieldDefinitions,
-  mapDiscoveredCustomFieldsToBugTrackerUi,
   uploadAttachment,
   createIssue,
   Project,
@@ -15,6 +12,7 @@ import {
   IssueStatus,
   Priority,
 } from "./redmine-client";
+import type { CustomFieldConfigEntry } from "./settings-webview";
 
 export class CreateIssueWebview {
   private panel: vscode.WebviewPanel | null = null;
@@ -22,8 +20,10 @@ export class CreateIssueWebview {
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly issueProvider?: IssueProvider,
   ) {}
+
+  private allowedCfNames: string[] | null = null;
+  private openedFromTemplate = false;
 
   async show(
     prefill?: {
@@ -32,16 +32,29 @@ export class CreateIssueWebview {
       trackerName?: string;
       statusName?: string;
       customFieldValues?: Record<string, string>;
+      customFieldNames?: string[];
       preAttachments?: { data: string; filename: string; contentType: string }[];
     },
     onCreated?: (issueId: number, subject: string) => void,
   ) {
+    const standalone = !prefill;
     if (this.panel) {
-      if (!prefill) { this.panel.reveal(); return; }
+      // Reveal only when the existing panel matches the request (both standalone).
+      // Otherwise the cached panel still holds the previous template's prefill /
+      // CF restriction — dispose and rebuild fresh.
+      if (standalone && !this.openedFromTemplate) {
+        this.panel.reveal();
+        return;
+      }
       this.panel.dispose();
       this.panel = null;
     }
     this.onCreated = onCreated ?? null;
+    this.openedFromTemplate = !standalone;
+
+    // When opened from a template, restrict the custom field UI to the names the
+    // template explicitly selected. Standalone "+ New Issue" passes nothing → show all.
+    this.allowedCfNames = prefill?.customFieldNames ?? null;
 
     const cfg = vscode.workspace.getConfiguration("redmine");
     const defaultProjectId  = cfg.get<string>("defaultProject")  ?? "";
@@ -98,53 +111,20 @@ export class CreateIssueWebview {
       }
 
       if (msg.command === "fetchFields") {
-        const cfg          = vscode.workspace.getConfiguration("redmine");
-        const typeBugId    = Number(cfg.get<string>("bugFieldTypeBugId")   || "0");
-        const foundInId    = Number(cfg.get<string>("bugFieldFoundInId")   || "0");
-        const rootCauseId  = Number(cfg.get<string>("bugFieldRootCauseId") || "0");
+        const trackerId = Number(msg.trackerId ?? 0);
+        const customFieldConfig = this.context.globalState.get<CustomFieldConfigEntry[]>("customFieldConfig") ?? [];
+        const trackerCfg = customFieldConfig.find((c) => c.trackerId === trackerId);
 
-        let fields: { id: number; name: string }[] = [];
-        let status: "ok" | "guide" | "none" = "ok";
-
-        if (typeBugId && foundInId && rootCauseId) {
-          fields = [
-            { id: typeBugId,   name: "Type Bug"   },
-            { id: foundInId,   name: "Found in"   },
-            { id: rootCauseId, name: "Root Cause" },
-          ];
+        if (!trackerCfg || trackerCfg.fields.length === 0) {
+          this.panel?.webview.postMessage({ command: "fieldsResult", fields: [], status: "none" });
         } else {
-          const bugIssueExists = this.context.globalState.get<boolean>("bugIssueExists");
-          const cached         = this.context.globalState.get<{ id: number; name: string }[]>("bugCustomFieldDefs");
-
-          if (bugIssueExists === false) {
-            status = "guide";
-          } else if (cached !== undefined) {
-            // Cache populated on startup (may be empty if template issue has no custom fields)
-            if (cached.length === 0) {
-              status = "none";
-            } else {
-              fields = mapDiscoveredCustomFieldsToBugTrackerUi(cached);
-            }
-          } else {
-            // No startup cache yet — fall back to live discovery
-            const trackerIdStr  = String(msg.trackerId ?? "").trim();
-            const projectKey    = (String(msg.projectId ?? "").trim() || defaultProjectId).trim();
-            const projectForApi = projectKey || undefined;
-            const loaded        = this.issueProvider?.getLoadedIssues() ?? [];
-            const cachedBugs    = loaded.filter(
-              (i) =>
-                String(i.tracker.id) === trackerIdStr ||
-                /^bug$/i.test((i.tracker.name ?? "").trim()),
-            );
-            const discovered = await resolveBugCustomFieldDefinitions(projectForApi, trackerIdStr, cachedBugs);
-            if (discovered.length === 0) {
-              status = "guide";
-            } else {
-              fields = mapDiscoveredCustomFieldsToBugTrackerUi(discovered);
-            }
-          }
+          // Restrict to template-selected CFs when invoked from a template
+          const allowed = this.allowedCfNames;
+          const fields = allowed
+            ? trackerCfg.fields.filter((f) => allowed.includes(f.name))
+            : trackerCfg.fields;
+          this.panel?.webview.postMessage({ command: "fieldsResult", fields, status: fields.length === 0 ? "none" : "ok" });
         }
-        this.panel?.webview.postMessage({ command: "fieldsResult", fields, status });
       }
 
       if (msg.command === "create") {
@@ -519,14 +499,7 @@ function buildHtml(
   )};
   let pendingFiles = PREFILL_FILES.slice();
   let lastIssueId  = null;
-  // ── Bug tracker custom fields (hardcoded) ────────────────────────
-  const BUG_FIELDS = [
-    { name: 'Type Bug',   options: ['UI/FE', 'BE', 'Performance'],      required: true,  defaultValue: '' },
-    { name: 'Found in',   options: ['Dev', 'Staging', 'Prod'],         required: true,  defaultValue: '' },
-    { name: 'Root Cause', options: ['Other'],                           required: true,  defaultValue: 'Other' },
-  ];
-  let bugFieldIds = {}; // populated from fetchFields response
-  let bugFieldStatus = 'ok'; // 'ok' | 'guide' | 'none'
+  let customFieldsConfig = []; // populated from fieldsResult
 
   // ── Project change → load members ────────────────────────────────
   function onProjectChange() {
@@ -538,54 +511,42 @@ function buildHtml(
     onTrackerChange();
   }
 
-  // ── Tracker change → show/hide bug fields ────────────────────────
+  // ── Tracker change → fetch custom fields for this tracker ────────
   function onTrackerChange() {
-    const sel         = document.getElementById('tracker');
-    const trackerName = (sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].text) || '';
-    const trackerId   = sel.value;
-    if (trackerName.toLowerCase() === 'bug' && trackerId) {
-      const projectId = document.getElementById('project').value;
-      vscode.postMessage({ command: 'fetchFields', trackerId, projectId });
+    const sel       = document.getElementById('tracker');
+    const trackerId = sel.value;
+    if (trackerId) {
+      vscode.postMessage({ command: 'fetchFields', trackerId });
     } else {
-      showBugFields(false);
+      renderCustomFields(false);
     }
   }
 
-  // ── Render bug-specific fields ────────────────────────────────────
-  function showBugFields(show) {
+  // ── Render dynamic custom fields ──────────────────────────────────
+  function renderCustomFields(show) {
     const section = document.getElementById('customFieldsSection');
     const body    = document.getElementById('customFieldsBody');
-    if (!show) { section.style.display = 'none'; body.innerHTML = ''; return; }
+    if (!show || customFieldsConfig.length === 0) {
+      section.style.display = 'none';
+      body.innerHTML = '';
+      return;
+    }
     section.style.display = '';
-    body.innerHTML = '<div class="row3">' + BUG_FIELDS.map(function(f) {
-      const id  = bugFieldIds[f.name] || 0;
-      const req = f.required ? '<span style="color:var(--vscode-errorForeground)">*</span>' : '';
+    body.innerHTML = '<div class="row3">' + customFieldsConfig.map(function(f) {
       const prefillVal = PREFILL_CF[f.name] || '';
-      const opts = ['<option value="">— Select —</option>']
-        .concat(f.options.map(function(o) {
-          const selected = prefillVal ? (o === prefillVal ? ' selected' : '') : (o === f.defaultValue ? ' selected' : '');
-          return '<option value="' + escHtml(o) + '"' + selected + '>' + escHtml(o) + '</option>';
-        })).join('');
-      return '<div class="field"><label class="fl">' + escHtml(f.name) + ' ' + req + '</label>'
-        + '<select data-cf-id="' + id + '" data-cf-name="' + escHtml(f.name) + '">' + opts + '</select></div>';
+      if (f.type === 'select') {
+        const opts = ['<option value="">— Select —</option>']
+          .concat((f.options || []).map(function(o) {
+            const selected = prefillVal === o ? ' selected' : '';
+            return '<option value="' + escHtml(o) + '"' + selected + '>' + escHtml(o) + '</option>';
+          })).join('');
+        return '<div class="field"><label class="fl">' + escHtml(f.name) + '</label>'
+          + '<select data-cf-id="' + f.id + '" data-cf-name="' + escHtml(f.name) + '">' + opts + '</select></div>';
+      } else {
+        return '<div class="field"><label class="fl">' + escHtml(f.name) + '</label>'
+          + '<input type="text" data-cf-id="' + f.id + '" data-cf-name="' + escHtml(f.name) + '" value="' + escHtml(prefillVal) + '"></div>';
+      }
     }).join('') + '</div>';
-  }
-
-  // ── Guide message when no Bug template issue exists ──────────────
-  function showBugGuide() {
-    const section = document.getElementById('customFieldsSection');
-    const body    = document.getElementById('customFieldsBody');
-    section.style.display = '';
-    body.innerHTML =
-      '<div style="padding:14px 16px;border-left:3px solid var(--vscode-charts-blue);' +
-      'background:color-mix(in srgb,var(--vscode-charts-blue) 8%,transparent);' +
-      'border-radius:5px;font-size:.87em;line-height:1.55">' +
-      '<div style="font-weight:700;margin-bottom:6px">ℹ️ No Bug template found</div>' +
-      'No existing Bug issue was found to use as a template for custom fields.<br>' +
-      'Please create one Bug issue directly on Redmine with all required custom fields ' +
-      '(<strong>Type Bug</strong>, <strong>Found in</strong>, <strong>Root Cause</strong>), ' +
-      'then reload this window so the extension can detect them automatically.' +
-      '</div>';
   }
 
   // ── Collect custom field values ───────────────────────────────────
@@ -678,24 +639,6 @@ function buildHtml(
     if (!trackerId) { showFb('error', 'Please select a tracker.'); return; }
     if (!subject)   { showFb('error', 'Subject is required.'); return; }
 
-    const trackerLabel = (document.getElementById('tracker').options[document.getElementById('tracker').selectedIndex] || {}).text || '';
-    if (trackerLabel.toLowerCase().trim() === 'bug'
-        && bugFieldStatus === 'ok'
-        && document.getElementById('customFieldsSection').style.display !== 'none') {
-      const selects = document.querySelectorAll('#customFieldsBody select[data-cf-id]');
-      for (let i = 0; i < selects.length; i++) {
-        const el = selects[i];
-        const cfId = Number(el.getAttribute('data-cf-id'));
-        if (!cfId) {
-          showFb('error', 'Không map được ID custom field Bug. Hãy làm mới danh sách issue (sidebar) hoặc nhập đủ 3 ID trong Settings; nếu tên field trên Redmine khác \"Type Bug\" / \"Found in\" / \"Root Cause\" thì cần nhập ID thủ công.');
-          return;
-        }
-        if (!String(el.value || '').trim()) {
-          showFb('error', 'Vui lòng chọn đủ 3 trường bổ sung bắt buộc (Type Bug, Found in, Root Cause).');
-          return;
-        }
-      }
-    }
 
     hideFb();
     if (pendingFiles.length) {
@@ -753,16 +696,8 @@ function buildHtml(
     }
 
     if (msg.command === 'fieldsResult') {
-      bugFieldStatus = msg.status || 'ok';
-      bugFieldIds = {};
-      (msg.fields || []).forEach(function(f) { bugFieldIds[f.name] = f.id; });
-      if (bugFieldStatus === 'none') {
-        showBugFields(false);
-      } else if (bugFieldStatus === 'guide') {
-        showBugGuide();
-      } else {
-        showBugFields(true);
-      }
+      customFieldsConfig = msg.fields || [];
+      renderCustomFields(msg.status === 'ok' && customFieldsConfig.length > 0);
     }
 
     if (msg.command === 'created') {

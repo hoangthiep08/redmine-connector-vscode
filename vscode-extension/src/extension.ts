@@ -30,7 +30,7 @@ export function activate(context: vscode.ExtensionContext) {
   const settingsWebview = new SettingsWebview(context);
 
   const feedbackWebview = new FeedbackWebview(context);
-  const createIssueWebview = new CreateIssueWebview(context, provider);
+  const createIssueWebview = new CreateIssueWebview(context);
   const testCaseWebview = new TestCaseWebview(context, createIssueWebview);
 
   const treeView = vscode.window.createTreeView("redmine.issueList", {
@@ -407,35 +407,53 @@ export function activate(context: vscode.ExtensionContext) {
     settingsWebview.show();
   } else {
     provider.refresh();
-    initBugCustomFieldCache(context).catch(() => {});
+    initTrackerCustomFieldCache(context).catch(() => {});
   }
 }
 
-async function initBugCustomFieldCache(context: vscode.ExtensionContext): Promise<void> {
+export interface TrackerFieldCacheEntry {
+  trackerId: number;
+  trackerName: string;
+  fields: { id: number; name: string }[];
+  fetched: boolean;
+}
+
+async function initTrackerCustomFieldCache(context: vscode.ExtensionContext): Promise<void> {
   try {
     const trackers = await listTrackers();
-    const bugTracker = trackers.find((t) => /^bug$/i.test(t.name.trim()));
-    if (!bugTracker) return;
-
     const cfg = vscode.workspace.getConfiguration("redmine");
     const projectId = cfg.get<string>("defaultProject") || undefined;
 
-    const result = await listIssues({
-      trackerId: String(bugTracker.id),
-      projectId,
-      limit: 1,
-    });
+    const existing = context.globalState.get<TrackerFieldCacheEntry[]>("trackerFieldCache") ?? [];
 
-    if (!result.issues.length) {
-      await context.globalState.update("bugIssueExists", false);
-      await context.globalState.update("bugCustomFieldDefs", []);
-      return;
+    for (const tracker of trackers) {
+      const cached = existing.find((e) => e.trackerId === tracker.id);
+      if (cached?.fetched) continue; // already fetched, skip
+
+      try {
+        const result = await listIssues({ trackerId: String(tracker.id), projectId, limit: 1 });
+        if (!result.issues.length) {
+          const idx = existing.findIndex((e) => e.trackerId === tracker.id);
+          const entry: TrackerFieldCacheEntry = { trackerId: tracker.id, trackerName: tracker.name, fields: [], fetched: true };
+          if (idx >= 0) existing[idx] = entry; else existing.push(entry);
+          continue;
+        }
+        const fullIssue = await getIssue(result.issues[0].id);
+        const fields = (fullIssue.custom_fields ?? []).map((cf) => ({ id: cf.id, name: cf.name }));
+        const idx = existing.findIndex((e) => e.trackerId === tracker.id);
+        const entry: TrackerFieldCacheEntry = { trackerId: tracker.id, trackerName: tracker.name, fields, fetched: true };
+        if (idx >= 0) existing[idx] = entry; else existing.push(entry);
+      } catch { /* skip this tracker silently */ }
     }
 
-    await context.globalState.update("bugIssueExists", true);
-    const fullIssue = await getIssue(result.issues[0].id);
-    const cfs = (fullIssue.custom_fields ?? []).map((cf) => ({ id: cf.id, name: cf.name }));
-    await context.globalState.update("bugCustomFieldDefs", cfs);
+    await context.globalState.update("trackerFieldCache", existing);
+
+    // Backward-compat: keep bugCustomFieldDefs for existing create-issue-webview logic
+    const bugEntry = existing.find((e) => /^bug$/i.test(e.trackerName));
+    if (bugEntry) {
+      await context.globalState.update("bugIssueExists", bugEntry.fields.length > 0);
+      await context.globalState.update("bugCustomFieldDefs", bugEntry.fields);
+    }
   } catch { /* silent, non-blocking */ }
 }
 

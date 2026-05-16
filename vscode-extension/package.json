@@ -3,7 +3,7 @@
   "displayName": "Redmine Connector",
   "description": "Connect your company's Redmine to VS Code, Cursor, Windsurf — manage issues and push to AI chat",
   "publisher": "hoangthiep",
-  "version": "1.2.0",
+  "version": "1.2.4",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -99,25 +99,22 @@
           "default": "",
           "description": "Display name for the default tracker (auto-filled when saving settings)"
         },
-        "redmine.bugFieldTypeBugId": {
-          "type": "string",
-          "default": "",
-          "description": "Custom field ID for 'Type Bug' (find in Redmine → Administration → Custom Fields)"
-        },
-        "redmine.bugFieldFoundInId": {
-          "type": "string",
-          "default": "",
-          "description": "Custom field ID for 'Found in' (find in Redmine → Administration → Custom Fields)"
-        },
-        "redmine.bugFieldRootCauseId": {
-          "type": "string",
-          "default": "",
-          "description": "Custom field ID for 'Root Cause' (find in Redmine → Administration → Custom Fields)"
-        },
         "redmine.feedbackWebhookUrl": {
           "type": "string",
           "default": "",
           "description": "n8n webhook URL to receive feedback submissions"
+        },
+        "redmine.issueDetection.include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["NG", "Fail"],
+          "description": "Status keywords (case-insensitive substring match). A test case row whose Status QC contains any of these shows the 'Create Issue' button."
+        },
+        "redmine.issueDetection.exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Status keywords that VETO Include. A row matching Exclude never shows 'Create Issue', even if it also matches Include. Example: 'test NG'."
         },
         "redmine.textFormat": {
           "type": "string",
@@ -352,9 +349,10 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "tsc -p ./tsconfig.json",
+    "check:webview": "node scripts/check-webview-scripts.js src/settings-webview.ts src/create-issue-webview.ts src/testcase-webview.ts",
+    "build": "npm run check:webview && tsc -p ./tsconfig.json",
     "watch": "tsc -watch -p ./tsconfig.json",
-    "package": "vsce package"
+    "package": "npm run check:webview && vsce package"
   },
   "dependencies": {
     "axios": "^1.6.0",
