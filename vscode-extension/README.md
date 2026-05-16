@@ -110,7 +110,7 @@ Use the **$(feedback) Send Feedback** button in the sidebar toolbar to report bu
 
 ## Release Notes
 
-### 1.2.4
+### 1.3.0
 - **Settings → 🎯 Issue Detection tab**: configure which `Status QC` values count as a failure via two keyword lists
   - **Include** (substring, case-insensitive): triggers the "Create Issue" button (default: `NG`, `Fail`)
   - **Exclude** (veto): even if Include matches, these prevent detection (e.g. `test NG`)

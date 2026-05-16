@@ -2,7 +2,7 @@
 
 All notable changes to the **Redmine Connector** extension are documented in this file.
 
-## [1.2.4]
+## [1.3.0]
 
 ### Added
 - **Settings → 🎯 Issue Detection tab** — configure which `Status QC` values mark a row as failed.
