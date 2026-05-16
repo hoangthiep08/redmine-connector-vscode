@@ -1294,25 +1294,6 @@ function buildHtml(
 
   function val(id) { return document.getElementById(id)?.value ?? ''; }
 
-  // ── Test Case Template ─────────────────────────────────────────────────────
-  function saveTemplate() {
-    const template = {
-      subject:    val('tmpl_subject'),
-      description: val('tmpl_description'),
-      tracker:    val('tmpl_tracker'),
-      status:     val('tmpl_status'),
-      assignee:   val('tmpl_assignee'),
-      priority:   val('tmpl_priority'),
-      dueDate:    val('tmpl_dueDate'),
-      attachment: val('tmpl_attachment'),
-    };
-    vscode.postMessage({ command: 'saveTemplate', template });
-  }
-
-  function clearTemplate() {
-    if (!confirm('Clear template? You can rebuild it anytime.')) return;
-    vscode.postMessage({ command: 'saveTemplate', template: {} });
-  }
 
   function showFb(id, type, msg) {
     const el = document.getElementById(id);

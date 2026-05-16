@@ -110,6 +110,37 @@ Use the **$(feedback) Send Feedback** button in the sidebar toolbar to report bu
 
 ## Release Notes
 
+### 1.2.4
+- **Settings → 🎯 Issue Detection tab**: configure which `Status QC` values count as a failure via two keyword lists
+  - **Include** (substring, case-insensitive): triggers the "Create Issue" button (default: `NG`, `Fail`)
+  - **Exclude** (veto): even if Include matches, these prevent detection (e.g. `test NG`)
+  - Replaces the old hardcoded `NG`/`Fail` check
+- **Export / Import Test Case Template from the Test Case Report header** (in addition to Settings); imports re-resolve `trackerId` by name so templates are portable across Redmine instances
+- **Clear Template** now uses a native VS Code modal in both Settings and the template builder (in-webview `confirm()` was unreliable)
+- **Test case classification simplified** — no more pass/skip/blocked categories. A row is either *To Create* (matches Include and not Exclude) or *Other*
+- **Available Columns panel** no longer lists fields the markdown header doesn't contain (`typeBug`, `rootCause`, etc. that the parser set to `undefined` are filtered out)
+- **Default Filters → Bug Tracker custom field IDs section removed** — obsolete after the per-tracker Custom Fields tab
+- **Fix**: TDZ crash (`Cannot access 'isFailableServer' before initialization`) when opening a test case report
+- **Fix**: duplicate `clearTemplate` function in Settings webview was shadowing the working one — Clear Template now actually clears
+
+### 1.2.3
+- **Settings → 🔧 Custom Fields tab redesigned**
+  - Sticky header + tab bar stay visible while scrolling
+  - Each tracker is a collapsible block; trackers without custom fields are sorted to the bottom
+  - Options for `select`-type fields managed as a list (`+ Add option` / per-row remove), preserved per-field even when toggling type back to `text`
+  - Switching field type (`text` ↔ `select`) auto-saves
+- **Import / Export Custom Fields configuration** — JSON file, matches entries by **tracker name + field name** so config is portable across Redmine instances
+- **Test Case Template builder — opt-in custom fields**
+  - Tracker dropdown now lists **all trackers** from Redmine
+  - Custom fields added one at a time via `+ Add Custom Field` (picker only shows fields not yet added); each row has a `×` remove with confirm
+  - All template CF inputs are text inputs supporting column-drop or fixed values
+- **Settings → Test Case Template** view stays in sync with the latest template (live config-change listener)
+- **Create-issue form respects template scope** — only the custom fields explicitly added to that template are rendered; standalone `+ New Issue` still shows all configured fields
+- **Case-insensitive option matching** for select-type custom fields — the canonical option text is sent to Redmine (e.g. `"dev"` → `"Dev"`)
+- **Fix**: regex `/\n/g` inside the TS template literal was cooked into a real newline, freezing the entire Settings webview. Added a pre-build `check:webview` step that catches this class of bug going forward
+- **Fix**: template builder lost typed data when adding a new custom field — drag-to-drop now fires an `input` event
+- **Fix**: export save dialog failed with `EROFS` when no workspace was open; defaults to the user's home directory
+
 ### 1.2.0 ✨ Test Case → Issue Template System
 - **Test Case Viewer**: Open markdown test case files, parse structured tables, view test results in a rich report
 - **Test Case Template Builder**: Settings → Test Case Template tab to define how test case columns map to issue fields

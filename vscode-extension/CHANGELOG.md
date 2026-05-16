@@ -18,6 +18,8 @@ All notable changes to the **Redmine Connector** extension are documented in thi
 
 ### Fixed
 - **Available Columns panel in template builder** no longer lists fields the markdown header doesn't contain — `typeBug`, `rootCause`, etc. that the parser set to `undefined` are filtered out. Only columns with real data in at least one TC are shown; sample data is pulled from the first non-empty row.
+- **TDZ crash when opening a test case report** — `failCount` referenced `isFailableServer` before its `const` declaration. Moved the helper to the top of `buildHtml`.
+- **Settings → Clear Template** wasn't working — a leftover duplicate `clearTemplate` function (using the unreliable in-webview `confirm()` and the wrong command name) was shadowing the working one. Dead code removed.
 
 ### Removed
 - **Default Filters → "Bug Tracker — Custom Field IDs" section** — obsolete after the per-tracker Custom Fields tab; the three settings (`bugFieldTypeBugId`, `bugFieldFoundInId`, `bugFieldRootCauseId`) are no longer used.
