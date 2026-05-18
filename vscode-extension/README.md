@@ -36,6 +36,20 @@ Push any issue to your AI assistant with one click, or use the built-in chat par
 | Add Comment | Post a note directly from the editor |
 | Copy as Markdown | Copy the issue as formatted Markdown |
 
+### Test Case → Issue Workflow
+Open any QC test case Markdown file and the extension parses the table into a rich report. Each failed row gets a one-click **Create Issue** button that pre-fills subject, description, attachments, and custom fields from your template — no manual copy-paste.
+
+- **Template Builder** with drag-and-drop column mapping. Drag any column header (e.g. `{{tcId}}`, `{{module}}`, `{{steps}}`) into Subject / Description / Custom Field inputs.
+- **Auto-attach evidence**: image files referenced in the test case are uploaded to the issue automatically.
+- **Issue Detection rules**: Settings → 🎯 Issue Detection lets you configure which `Status QC` values count as a failure via **Include** keywords (e.g. `NG`, `Fail`) and **Exclude** vetoes (e.g. `test NG`). Case-insensitive substring match.
+- **Export / Import templates** as JSON so the whole QC team uses the same one.
+
+### Per-Tracker Custom Fields
+Settings → 🔧 Custom Fields discovers every tracker's custom fields from real issues (no admin API needed) and lets you mark each one as a text input or a select with predefined options. Collapsible per-tracker view; option lists managed inline (`+ Add option` / `×` remove). Config is Export/Import-friendly — share with your team via a single JSON file.
+
+### Inline Custom Fields on Create
+When creating an issue from a test case template, only the custom fields you explicitly added to that template appear in the form. Standalone `+ New Issue` still shows the full set. Select-type values are matched case-insensitively against configured options before submission — so `dev` lines up with `Dev` automatically.
+
 ---
 
 ## Requirements
@@ -109,6 +123,28 @@ Use the **$(feedback) Send Feedback** button in the sidebar toolbar to report bu
 ---
 
 ## Release Notes
+
+### 1.4.1
+- **Inline issue detail panel** in the Issue List webview — click any row and the detail slides in on the right side of the same tab (GitLab-style split view).
+  - Sticky toolbar with `↗ Open in full tab` stays at the top while scrolling.
+  - Shows subject, status / priority / tracker / % chips, assignee, dates, custom fields, description, last 5 comments, image attachments.
+  - **Inline image rendering** in descriptions and comments (textile `!filename!` and markdown `![alt](filename)` references resolved against attachments).
+  - **Lightbox**: click any image for full-screen zoom; `Esc` or click-outside to close.
+- **ID badge** now uses VS Code's theme-aware badge colors (subtle pill, no more red).
+- Removed `Found in` column and the unused selection checkbox column from the issue table — `Found in` is still visible inside the detail panel.
+
+### 1.4.0
+- **🗂 Redmine-style Issue List webview** — new "Open Issue List" button next to **Refresh** in the sidebar title bar. Opens a tab that mirrors Redmine's issue table:
+  - Top filter panel pre-populated with your **Default Filters** from Settings (project, tracker, status, assignee, custom fields). Add or remove filter rows via the **`+ Add filter`** dropdown.
+  - Apply / Clear / **Save to Global** (push the current filter into Settings → Default Filters).
+  - Sortable column headers with `↑`/`↓` indicators, pagination (`Showing X–Y of Z`), page size 25.
+  - Click an issue ID or subject to open the existing issue detail webview.
+- **Custom field filters everywhere**
+  - **Issue List webview**: any configured CF can be added as a filter row (text or dropdown depending on Settings).
+  - **Settings → Default Filters → Default Custom Field Filters**: new section to set CF defaults that apply on every load.
+  - **Sidebar** respects the same defaults — `customFieldConfig` is now threaded through every `listIssues()` call.
+- **Marketplace categories** bumped from `Other` to `SCM Providers`, `Testing`, `Other` — more discoverable.
+- **UI polish**: softer brick-red for the ID badge in the new Issue List view (was glaring red).
 
 ### 1.3.0
 - **Settings → 🎯 Issue Detection tab**: configure which `Status QC` values count as a failure via two keyword lists

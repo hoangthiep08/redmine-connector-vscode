@@ -105,20 +105,36 @@ export async function listIssues(params: {
   projectId?: string;
   statusId?: string;
   assignedToId?: string;
+  authorId?: string;
   trackerId?: string;
+  priorityId?: string;
   limit?: number;
   offset?: number;
   subject?: string;
+  sort?: string;
+  /** include directives for the Redmine API, e.g. "attachments,journals" */
+  include?: string;
+  /** Raw custom field filters: { 5: "Dev", 6: "UI/FE" } → cf_5=Dev&cf_6=UI/FE */
+  customFields?: Record<number | string, string>;
 }): Promise<{ issues: Issue[]; total_count: number }> {
   const query: Record<string, string | number> = {
     limit: params.limit ?? 50,
     offset: params.offset ?? 0,
   };
-  if (params.projectId) query["project_id"] = params.projectId;
-  if (params.statusId) query["status_id"] = params.statusId;
+  if (params.projectId)    query["project_id"]     = params.projectId;
+  if (params.statusId)     query["status_id"]      = params.statusId;
   if (params.assignedToId) query["assigned_to_id"] = params.assignedToId;
-  if (params.trackerId) query["tracker_id"] = params.trackerId;
-  if (params.subject) query["subject"] = `~${params.subject}`;
+  if (params.authorId)     query["author_id"]      = params.authorId;
+  if (params.trackerId)    query["tracker_id"]     = params.trackerId;
+  if (params.priorityId)   query["priority_id"]    = params.priorityId;
+  if (params.subject)      query["subject"]        = `~${params.subject}`;
+  if (params.sort)         query["sort"]           = params.sort;
+  if (params.include)      query["include"]        = params.include;
+  if (params.customFields) {
+    for (const [key, val] of Object.entries(params.customFields)) {
+      if (val !== undefined && val !== "") query[`cf_${key}`] = val;
+    }
+  }
 
   const res = await getClient().get("/issues.json", { params: query });
   return res.data;

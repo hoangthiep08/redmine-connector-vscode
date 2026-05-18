@@ -2,6 +2,47 @@
 
 All notable changes to the **Redmine Connector** extension are documented in this file.
 
+## [1.4.1]
+
+### Added
+- **Inline issue detail panel** in the Issue List webview — click any row and the detail slides in on the right side of the same tab (GitLab-style split view).
+  - Sticky toolbar at the top of the panel with `↗ Open in full tab` button and close `×` — stays visible while scrolling the panel content.
+  - Shows: subject, status / priority / tracker / % chips, assignee, dates, custom fields, description, last 5 comments, image attachments.
+  - **Inline image rendering**: textile (`!filename!`) and markdown (`![alt](filename)`) references inside description + comments are resolved to actual images. Images load lazily via `fetchAttachmentAsDataUrl` (same mechanism as the full issue webview).
+  - **Lightbox**: click any image → full-screen zoom overlay (`Esc` or click-outside to close).
+  - `Esc` closes the lightbox first, then the detail panel.
+  - Detail panel is ~100px taller than the previous draft (`calc(100vh - 140px)`).
+
+### Changed
+- **ID badge** in the issue table now uses VS Code's theme-aware `--vscode-badge-background` / `--vscode-badge-foreground` (subtle pill, no more eye-catching red). Hover lifts to the link color; the row's `.selected` state inverts to `--vscode-textLink-foreground` background.
+
+### Removed
+- **`Found in` column** from the issue list table (data is still visible in the detail panel under Custom Fields).
+- **Selection checkbox column** — removed for now since no bulk-actions are implemented. Will return once bulk-create/update is wired.
+
+### Internal
+- `redmine-client.listIssues()` extended with `authorId`, `priorityId`, `sort`, `include`, and `customFields` (`cf_<id>` query params).
+- Pre-build webview-script syntax check now also covers `src/issue-list-webview.ts`.
+
+## [1.4.0]
+
+### Added
+- **🗂 Redmine-style Issue List webview** — new command `Redmine: Open Issue List` (also surfaced as `$(list-flat)` button next to **Refresh** in the sidebar title bar).
+  - Top filter panel: pre-populated with the active **Default Filters** from Settings (project, tracker, status, assignee, default custom fields). Add/remove filter rows individually; **`+ Add filter`** dropdown lists every built-in + every configured custom field grouped under a `── Custom fields ──` separator.
+  - **Save to Global** action pushes the current filter back into Settings → Default Filters with a confirm modal.
+  - Sortable column headers (#, Tracker, Status, Priority, Subject, Assignee, % Done) with asc/desc indicators.
+  - Pagination (Prev / page numbers / Next) with `Showing X–Y of Z` counter, page size 25.
+  - Click an issue ID or subject to open the existing issue detail webview.
+- **Custom field filters everywhere**
+  - **Issue List webview**: any configured CF can be added as a filter row (text or `select` depending on Settings).
+  - **Settings → Default Filters → Default Custom Field Filters**: new section to set CF defaults that apply on every load. Persisted at `redmine.defaultCustomFields`.
+  - **Sidebar issue list** (`IssueProvider`): `resolveQueryParams()` now resolves `defaultCustomFields` and threads them through every `listIssues()` call (single-project, multi-project, append).
+- **Marketplace categories**: bumped from `["Other"]` to `["SCM Providers", "Testing", "Other"]` — more discoverable for QC / dev workflows.
+
+### Changed
+- **ID badge** in the new Issue List webview uses a muted brick-red (`#9c4040`) instead of the harsh `--vscode-errorForeground`. Hover lightens to `#b35353`.
+- `redmine-client.listIssues()` extended with `authorId`, `priorityId`, `sort`, `include`, and `customFields` (`cf_<id>` query params).
+
 ## [1.3.0]
 
 ### Added

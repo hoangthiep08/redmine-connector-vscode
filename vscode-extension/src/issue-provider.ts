@@ -269,13 +269,14 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     this._onDidChangeTreeData.fire(null);
 
     try {
-      const { statusId, assignedToId, trackerId, customStatusIds } = await this.resolveQueryParams();
+      const { statusId, assignedToId, trackerId, customStatusIds, customFields } = await this.resolveQueryParams();
       const result = await listIssues({
         projectId: String(projectId),
         statusId,
         assignedToId,
         trackerId,
         subject: this.filter.subject,
+        customFields,
         limit: this.PAGE_SIZE_MULTI,
         offset: pd.offset,
       });
@@ -300,6 +301,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     assignedToId: string | undefined;
     trackerId: string | undefined;
     customStatusIds: string[];
+    customFields: Record<string, string> | undefined;
   }> {
     const config = vscode.workspace.getConfiguration("redmine");
     const onlyMe = config.get<boolean>("showOnlyAssignedToMe") ?? false;
@@ -336,7 +338,19 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     const defaultTrackerId = config.get<string>("defaultTrackerId") ?? "";
     const trackerId = this.filter.trackerId || defaultTrackerId || undefined;
 
-    return { statusId, assignedToId, trackerId, customStatusIds };
+    const cfMap = config.get<Record<string, string>>("defaultCustomFields") ?? {};
+    const customFields: Record<string, string> = {};
+    for (const [k, v] of Object.entries(cfMap)) {
+      if (typeof v === "string" && v.trim() !== "") customFields[k] = v;
+    }
+
+    return {
+      statusId,
+      assignedToId,
+      trackerId,
+      customStatusIds,
+      customFields: Object.keys(customFields).length ? customFields : undefined,
+    };
   }
 
   private async load(append = false) {
@@ -351,7 +365,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     try {
       const config = vscode.workspace.getConfiguration("redmine");
       const defaultProject = config.get<string>("defaultProject") ?? "";
-      const { statusId, assignedToId, trackerId, customStatusIds } = await this.resolveQueryParams();
+      const { statusId, assignedToId, trackerId, customStatusIds, customFields } = await this.resolveQueryParams();
 
       const subjectTerm = this.filter.subject?.trim() ?? "";
       const idMatch = /^#?(\d+)$/.exec(subjectTerm);
@@ -386,6 +400,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
                   assignedToId,
                   trackerId,
                   subject: this.filter.subject,
+                  customFields,
                   limit: this.PAGE_SIZE_MULTI,
                   offset: 0,
                 });
@@ -417,6 +432,7 @@ export class IssueProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
             assignedToId,
             trackerId,
             subject: this.filter.subject,
+            customFields,
             limit: this.PAGE_SIZE,
             offset: append ? this.offset : 0,
           });

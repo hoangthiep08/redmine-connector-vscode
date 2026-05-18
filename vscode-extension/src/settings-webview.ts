@@ -44,6 +44,7 @@ export class SettingsWebview {
       testCaseTemplate:     cfg.get<Record<string, unknown>>("testCaseTemplate") ?? {},
       issueDetectInclude:   cfg.get<string[]>("issueDetection.include") ?? ["NG", "Fail"],
       issueDetectExclude:   cfg.get<string[]>("issueDetection.exclude") ?? [],
+      defaultCustomFields:  cfg.get<Record<string, string>>("defaultCustomFields") ?? {},
     };
 
     // Pre-fetch lookup data before building the webview
@@ -115,6 +116,7 @@ export class SettingsWebview {
         await c.update("defaultAssigneeName",   msg.defaultAssigneeName ?? "",                    vscode.ConfigurationTarget.Global);
         await c.update("defaultTrackerId",      msg.defaultTrackerId ?? "",                        vscode.ConfigurationTarget.Global);
         await c.update("defaultTrackerName",    msg.defaultTrackerName ?? "",                      vscode.ConfigurationTarget.Global);
+        await c.update("defaultCustomFields",   msg.defaultCustomFields ?? {},                     vscode.ConfigurationTarget.Global);
         this.panel?.webview.postMessage({ command: "saved" });
         vscode.commands.executeCommand("redmine.refresh");
       }
@@ -485,6 +487,7 @@ function buildHtml(
     testCaseTemplate: Record<string, unknown>;
     issueDetectInclude: string[];
     issueDetectExclude: string[];
+    defaultCustomFields: Record<string, string>;
   },
   projects: { id: string; name: string }[],
   statuses: { id: string; name: string; is_closed: boolean }[],
@@ -715,6 +718,20 @@ function buildHtml(
   </div>
 
   <hr class="divider">
+
+  <div class="section">
+    <div class="section-title">Default Custom Field Filters</div>
+    <div class="hint" style="margin-bottom:10px">Apply custom-field filters automatically on the sidebar issue list. The fields available depend on what you've configured in the <strong>🔧 Custom Fields</strong> tab.</div>
+    <div id="defaultCfRows" style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px"></div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <select id="defaultCfPicker" style="flex:1">
+        <option value="">— Add a custom field filter —</option>
+      </select>
+      <button type="button" class="btn btn-sec btn-sm" onclick="addDefaultCf()">+ Add</button>
+    </div>
+  </div>
+
+  <hr class="divider">
   <div class="btn-row">
     <button class="btn" onclick="save()">💾 Save Settings</button>
     <button class="btn btn-sec btn-sm" onclick="reloadAll()">🔄 Reload from Redmine</button>
@@ -832,12 +849,14 @@ function buildHtml(
   const CUSTOM_FIELD_CONFIG = ${JSON.stringify(customFieldConfig)};
   const INIT_DETECT_INC = ${JSON.stringify(init.issueDetectInclude)};
   const INIT_DETECT_EXC = ${JSON.stringify(init.issueDetectExclude)};
+  const INIT_DEFAULT_CF = ${JSON.stringify(init.defaultCustomFields)};
 
   let _membersLoaded = MEMBERS.length > 0;
   let _cfConfig = JSON.parse(JSON.stringify(CUSTOM_FIELD_CONFIG)); // deep copy
 
   let _detectInc = (INIT_DETECT_INC || []).slice();
   let _detectExc = (INIT_DETECT_EXC || []).slice();
+  let _defaultCf = Object.assign({}, INIT_DEFAULT_CF || {}); // { cfId: value }
 
   // Render immediately on load
   renderProjects(PROJECTS);
@@ -847,6 +866,7 @@ function buildHtml(
   renderTemplate(INIT_TPL);
   renderCustomFields(TRACKER_FIELD_CACHE, _cfConfig);
   renderDetectionLists();
+  renderDefaultCfRows();
 
   // ── Tab switching ──────────────────────────────────────────────────────────
   function switchTab(name, btn) {
@@ -1194,6 +1214,91 @@ function buildHtml(
     saveDetection();
   }
 
+  // ── Default Custom Field Filters ───────────────────────────────────────────
+  function flatCfList() {
+    const arr = [];
+    const seen = new Set();
+    (CUSTOM_FIELD_CONFIG || []).forEach(function(entry) {
+      (entry.fields || []).forEach(function(f) {
+        if (seen.has(f.id)) return;
+        seen.add(f.id);
+        arr.push({ id: f.id, name: f.name, trackerName: entry.trackerName, type: f.type, options: f.options || [] });
+      });
+    });
+    return arr;
+  }
+
+  function renderDefaultCfRows() {
+    const wrap = document.getElementById('defaultCfRows');
+    const picker = document.getElementById('defaultCfPicker');
+    const all = flatCfList();
+    const ids = Object.keys(_defaultCf);
+
+    if (ids.length === 0) {
+      wrap.innerHTML = '<div style="font-size:.82em;color:var(--vscode-descriptionForeground);font-style:italic">(no custom field filters set)</div>';
+    } else {
+      let html = '';
+      ids.forEach(function(cfId) {
+        const def = all.find(function(c) { return String(c.id) === String(cfId); });
+        if (!def) return; // CF no longer configured — silently skip
+        const labelTitle = 'Discovered on tracker: ' + def.trackerName;
+        let inputHtml;
+        if (def.type === 'select' && def.options.length > 0) {
+          const opts = ['<option value="">(any)</option>']
+            .concat(def.options.map(function(o) {
+              return '<option value="' + escAttr(o) + '"' + (_defaultCf[cfId] === o ? ' selected' : '') + '>' + escAttr(o) + '</option>';
+            }))
+            .join('');
+          inputHtml = '<select data-cf-id="' + def.id + '" class="default-cf-inp" oninput="onDefaultCfInput(this)" onchange="onDefaultCfInput(this)">' + opts + '</select>';
+        } else {
+          inputHtml = '<input type="text" data-cf-id="' + def.id + '" class="default-cf-inp" value="' + escAttr(_defaultCf[cfId] || '') + '" placeholder="Value" oninput="onDefaultCfInput(this)">';
+        }
+        html += '<div style="display:grid;grid-template-columns:160px 1fr 28px;gap:8px;align-items:center">'
+          + '<label style="font-size:.85em;font-weight:600" title="' + escAttr(labelTitle) + '">' + escAttr(def.name) + '</label>'
+          + inputHtml
+          + '<button type="button" class="rm" onclick="removeDefaultCf(\\'' + cfId + '\\')" title="Remove">×</button>'
+          + '</div>';
+      });
+      wrap.innerHTML = html;
+    }
+
+    // Populate picker with CFs not yet added
+    picker.innerHTML = '<option value="">— Add a custom field filter —</option>';
+    all.forEach(function(c) {
+      if (_defaultCf[c.id] !== undefined) return;
+      const opt = document.createElement('option');
+      opt.value = c.id;
+      opt.textContent = c.name + '  (' + c.trackerName + ')';
+      picker.appendChild(opt);
+    });
+  }
+
+  function addDefaultCf() {
+    const picker = document.getElementById('defaultCfPicker');
+    const cfId = picker.value;
+    if (!cfId) return;
+    _defaultCf[cfId] = '';
+    picker.value = '';
+    renderDefaultCfRows();
+  }
+
+  function removeDefaultCf(cfId) {
+    delete _defaultCf[cfId];
+    renderDefaultCfRows();
+  }
+
+  function onDefaultCfInput(el) {
+    const cfId = el.dataset.cfId;
+    if (cfId in _defaultCf) _defaultCf[cfId] = el.value || '';
+  }
+
+  function syncDefaultCfFromDom() {
+    document.querySelectorAll('.default-cf-inp').forEach(function(el) {
+      const cfId = el.dataset.cfId;
+      if (cfId in _defaultCf) _defaultCf[cfId] = el.value || '';
+    });
+  }
+
   function renderMembers(list, selectedId) {
     const sel = document.getElementById('defaultAssigneeId');
     const currentVal = selectedId !== undefined ? selectedId : sel.value;
@@ -1275,6 +1380,14 @@ function buildHtml(
     const trackerName = (trackerSel.selectedIndex >= 0 && trackerId)
       ? trackerSel.options[trackerSel.selectedIndex].text : '';
 
+    // Sync any latest typed values, then strip empty entries
+    syncDefaultCfFromDom();
+    const cfPayload = {};
+    Object.keys(_defaultCf).forEach(function(id) {
+      const v = (_defaultCf[id] || '').trim();
+      if (v) cfPayload[id] = v;
+    });
+
     vscode.postMessage({
       command: 'save',
       baseUrl:              val('baseUrl'),
@@ -1289,6 +1402,7 @@ function buildHtml(
       defaultAssigneeName:  assigneeName,
       defaultTrackerId:     trackerId,
       defaultTrackerName:   trackerName,
+      defaultCustomFields:  cfPayload,
     });
   }
 

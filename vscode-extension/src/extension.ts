@@ -19,6 +19,7 @@ import { SettingsWebview } from "./settings-webview";
 import { FeedbackWebview } from "./feedback-webview";
 import { CreateIssueWebview } from "./create-issue-webview";
 import { TestCaseWebview } from "./testcase-webview";
+import { IssueListWebview } from "./issue-list-webview";
 import { pushIssueToAI, copyIssueMarkdown } from "./push-to-ai";
 import { registerChatParticipant } from "./chat-participant";
 
@@ -32,6 +33,7 @@ export function activate(context: vscode.ExtensionContext) {
   const feedbackWebview = new FeedbackWebview(context);
   const createIssueWebview = new CreateIssueWebview(context);
   const testCaseWebview = new TestCaseWebview(context, createIssueWebview);
+  const issueListWebview = new IssueListWebview(context);
 
   const treeView = vscode.window.createTreeView("redmine.issueList", {
     treeDataProvider: provider,
@@ -55,6 +57,10 @@ export function activate(context: vscode.ExtensionContext) {
 
     ["redmine.configure", async () => {
       await settingsWebview.show();
+    }],
+
+    ["redmine.openIssueList", async () => {
+      await issueListWebview.show();
     }],
 
     ["redmine.openIssue", async (item: unknown) => {
