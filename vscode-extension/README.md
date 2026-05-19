@@ -124,6 +124,13 @@ Use the **$(feedback) Send Feedback** button in the sidebar toolbar to report bu
 
 ## Release Notes
 
+### 1.4.2
+- **Fixed**: test case header detection now covers every column in the markdown table — `Page/Screen`, `PC`, `SP`, `Q&A`, `Status 2 (QC)`, `Date 2`, `ID Bug`, `Browser/Device`, and any custom header now show up as draggable chips in the template builder.
+- Template interpolation accepts both raw header names (`{{TC ID}}`, `{{Page/Screen}}`) and legacy camelCase keys (`{{tcId}}`, `{{module}}`). Existing templates keep working.
+- **Filter persistence** in the Issue List webview — the last applied filter is restored on reopen. New `⤺ Reset` button pulls fresh defaults from Settings.
+- **`💬 Push to AI`** button in the inline detail panel (right side of the Issue List) — same flow as the sidebar context menu, no need to open the full issue view.
+- **Compact filter grid** — 2–3 filters per row instead of one row each.
+
 ### 1.4.1
 - **Inline issue detail panel** in the Issue List webview — click any row and the detail slides in on the right side of the same tab (GitLab-style split view).
   - Sticky toolbar with `↗ Open in full tab` stays at the top while scrolling.

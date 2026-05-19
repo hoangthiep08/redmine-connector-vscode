@@ -2,6 +2,20 @@
 
 All notable changes to the **Redmine Connector** extension are documented in this file.
 
+## [1.4.2]
+
+### Fixed
+- **Test case header detection now covers every column** in the markdown table — `Page/Screen`, `PC`, `SP`, `Q&A`, `Status 2 (QC)`, `Date 2`, `ID Bug`, `Browser/Device`, and any other custom header now show up as draggable chips in the template builder. The legacy parser only knew about a fixed set (`tcId`, `module`, `priority`, …) and silently dropped anything else.
+
+### Changed
+- **Template interpolation accepts raw header names** in addition to the legacy camelCase keys. New templates can use `{{TC ID}}`, `{{Page/Screen}}`, `{{Status 2 (QC)}}`, etc. Existing templates using `{{tcId}}`, `{{module}}`, `{{foundIn}}` continue to work — the lookup tries TC's typed field first, then falls back to the raw header (case-insensitive).
+- **"Available Columns"** panel in the template builder now lists every header from the markdown source (in source order), filtered to those with real data in at least one TC.
+
+### Added
+- **Filter persistence in the Issue List webview** — the most recent filter is saved to `globalState` on every Apply, so reopening the tab restores it instead of re-reading Settings defaults. New `⤺ Reset` button next to **Clear** discards the saved filter and rebuilds from Settings defaults.
+- **Detail panel — `💬 Push to AI` button** in the sticky toolbar pushes the selected issue to the AI chat (same QuickPick as the sidebar context menu) without leaving the list.
+- **Compact filter grid** — filter rows now lay out in a responsive `auto-fill` grid (2–3 per row on a typical viewport) instead of one full row per filter.
+
 ## [1.4.1]
 
 ### Added

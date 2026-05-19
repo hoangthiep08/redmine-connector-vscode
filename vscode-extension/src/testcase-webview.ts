@@ -24,6 +24,13 @@ interface TC {
   typeBug?: string;
   foundIn?: string;
   rootCause?: string;
+  /**
+   * Raw column map captured straight from the markdown header row, keyed by the
+   * header text as the user wrote it ("TC ID", "Page/Screen", "Status 2 (QC)", …).
+   * Anything the legacy hardcoded fields don't cover ends up here and is
+   * available to templates as `{{Header Name}}`.
+   */
+  _columns?: Record<string, string>;
 }
 
 interface LinkedIssue {
@@ -45,6 +52,7 @@ function parseMarkdownTable(content: string): TC[] {
   const lines = content.split("\n");
   let headerIdx = -1;
   const colMap: Record<string, number> = {};
+  const headerTexts: string[] = []; // original header text, preserving case + spacing
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -52,7 +60,9 @@ function parseMarkdownTable(content: string): TC[] {
       headerIdx = i;
       const parts = line.split("|").slice(1, -1);
       parts.forEach((h, idx) => {
-        colMap[h.trim().toLowerCase()] = idx;
+        const text = h.trim();
+        headerTexts.push(text);
+        colMap[text.toLowerCase()] = idx;
       });
       break;
     }
@@ -90,6 +100,14 @@ function parseMarkdownTable(content: string): TC[] {
     const tcId = get("tc id");
     if (!tcId || /^:?-+:?$/.test(tcId)) continue;
 
+    // Capture every column straight from the header row, regardless of whether
+    // the hardcoded TC fields below cover it. This is what powers the template
+    // builder's "Available Columns" list and {{Header Name}} interpolation.
+    const _columns: Record<string, string> = {};
+    headerTexts.forEach((h, idx) => {
+      _columns[h] = (cells[idx] ?? "").trim();
+    });
+
     tcs.push({
       tcId,
       category: find("category"),
@@ -108,6 +126,7 @@ function parseMarkdownTable(content: string): TC[] {
       typeBug:   find("type bug", "bug type")                       || undefined,
       foundIn:   find("found in", "found_in", "foundin")            || undefined,
       rootCause: find("root cause", "root_cause", "rootcause")      || undefined,
+      _columns,
     });
   }
 
@@ -144,28 +163,42 @@ function formatDescription(tc: TC): string {
 
 function interpolateTemplate(template: string, tc: TC): string {
   const tcRecord = tc as unknown as Record<string, unknown>;
+  const cols = (tc._columns ?? {}) as Record<string, string>;
+  // Case-insensitive header lookup: "tc id" → "TC ID" → cell value
+  const colLookup: Record<string, string> = {};
+  for (const [k, v] of Object.entries(cols)) colLookup[k.toLowerCase()] = v ?? "";
+
+  /** Look up a placeholder `{{key}}` against TC's camelCase fields then raw headers. */
+  const lookup = (rawKey: string): { value: string; found: boolean } => {
+    const key = rawKey.trim();
+    // 1) Legacy camelCase property on TC (tcId, module, foundIn, …)
+    if (key && key !== "_columns" && key in tcRecord) {
+      const v = tcRecord[key];
+      const s = (typeof v === "string" ? v : String(v ?? "")).trim();
+      return { value: s, found: s.length > 0 };
+    }
+    // 2) Raw header text (case-insensitive)
+    const lower = key.toLowerCase();
+    if (lower in colLookup) {
+      const s = (colLookup[lower] || "").trim();
+      return { value: s, found: s.length > 0 };
+    }
+    return { value: "", found: false };
+  };
+
   const lines = template.split("\n");
   const output: string[] = [];
-
   for (const line of lines) {
     let interpolated = line;
     let hasEmptyKey = false;
-
-    for (const [key, value] of Object.entries(tcRecord)) {
-      const placeholder = `{{${key}}}`;
-      if (interpolated.includes(placeholder)) {
-        const val = typeof value === "string" ? value.trim() : String(value ?? "").trim();
-        if (!val) {
-          hasEmptyKey = true;
-          break;
-        }
-        interpolated = interpolated.split(placeholder).join(val);
-      }
+    const placeholders = line.match(/\{\{[^}]+\}\}/g) ?? [];
+    for (const ph of placeholders) {
+      const key = ph.slice(2, -2);
+      const r = lookup(key);
+      if (!r.found) { hasEmptyKey = true; break; }
+      interpolated = interpolated.split(ph).join(r.value);
     }
-
-    if (!hasEmptyKey) {
-      output.push(interpolated);
-    }
+    if (!hasEmptyKey) output.push(interpolated);
   }
 
   // Remove consecutive blank lines
@@ -520,28 +553,32 @@ function buildHtml(fileName: string, filePath: string, tcs: TC[], linkMap: Issue
   const failCount  = tcs.filter(t => isFailableServer(t.statusQc)).length;
   const otherCount = tcs.length - failCount;
 
-  // Extract available columns: keep only keys that have a real value in at
-  // least one TC. Optional TC fields (typeBug, foundIn, rootCause, browser, …)
-  // are set to `undefined` by the parser when the header doesn't contain a
-  // matching column — without this filter they'd still show up as draggable
-  // chips with "undefined" sample data.
-  const firstTc = tcs.length > 0 ? tcs[0] : null;
-  const candidateKeys = firstTc ? Object.keys(firstTc).filter(k => !k.startsWith("_") && k !== "line") : [];
-  const availableColumns = candidateKeys.filter(k =>
-    tcs.some(t => {
-      const v = (t as unknown as Record<string, unknown>)[k];
+  // Available columns are taken straight from the markdown header row (preserved
+  // in `tc._columns`). This is the only way to surface headers the legacy
+  // TC interface doesn't cover (Page/Screen, PC, SP, Q&A, Status 2 (QC), …).
+  // A column shows up only if at least one TC has a non-empty value for it.
+  const headerOrder: string[] = [];
+  const seenHeaders = new Set<string>();
+  for (const t of tcs) {
+    const cols = (t._columns ?? {}) as Record<string, string>;
+    for (const h of Object.keys(cols)) {
+      if (!seenHeaders.has(h)) { seenHeaders.add(h); headerOrder.push(h); }
+    }
+  }
+  const availableColumns = headerOrder.filter((h) =>
+    tcs.some((t) => {
+      const v = (t._columns ?? {})[h];
       return v !== undefined && v !== null && String(v).trim() !== "";
     }),
   );
   const sampleData: Record<string, string> = {};
-  availableColumns.forEach(col => {
-    // Show the first non-empty sample so the user sees realistic data
-    const sampleTc = tcs.find(t => {
-      const v = (t as unknown as Record<string, unknown>)[col];
+  availableColumns.forEach((col) => {
+    const sampleTc = tcs.find((t) => {
+      const v = (t._columns ?? {})[col];
       return v !== undefined && v !== null && String(v).trim() !== "";
     });
-    const val = sampleTc ? (sampleTc as unknown as Record<string, unknown>)[col] : "";
-    sampleData[col] = typeof val === "string" ? val.substring(0, 50) : String(val).substring(0, 50);
+    const val = sampleTc ? (sampleTc._columns ?? {})[col] : "";
+    sampleData[col] = typeof val === "string" ? val.substring(0, 50) : String(val ?? "").substring(0, 50);
   });
 
   const tcJson    = JSON.stringify(tcs).replace(/<\//g, "<\\/");
