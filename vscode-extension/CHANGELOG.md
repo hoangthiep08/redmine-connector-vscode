@@ -2,6 +2,27 @@
 
 All notable changes to the **Redmine Connector** extension are documented in this file.
 
+## [1.5.0]
+
+### Added
+- **🚀 Bulk-create issues from selected test cases.**
+  - New checkbox column on the Test Case Report. Only **failable + unlinked** rows are selectable (linked TCs and pass/skip rows are excluded).
+  - **Sticky bulk action bar at the top of the table** (stays visible while scrolling): **Select all** + **Unselect all** are always shown; **`✚ Create N Issues`** sits next to them — disabled when no row is selected, active and labelled with the count once you tick a checkbox; selection count chip appears beside the buttons when ≥1 row is selected.
+  - Click **`✚ Create N Issues`** → opens the Create Issue form in **bulk mode**: a banner explains what's about to happen, the **Subject / Description / Custom Fields** show a *preview* using the first selected TC, and the rest of the form (**Project / Tracker / Status / Priority / Assignee / Due Date**) is the *common* settings that will apply to every issue.
+  - On submit, a modal confirms (the form **stays open** during confirmation — cancelling keeps you on the form so you can adjust and resubmit). Once confirmed, the extension loops over the TCs creating one Redmine issue per TC:
+    - Subject, Description, Custom Fields are **re-interpolated from the template per test case** — so each issue has its own data, not the preview shown in the form.
+    - For any required custom field that interpolates to empty for a given TC (e.g. "Type Bug" on a TC without that column populated), the CF value picked in the bulk form is used as a **fallback** so the issue still creates successfully.
+    - Evidence attachments are parsed and uploaded **per test case**.
+    - Select-type custom fields are validated case-insensitively against the configured options.
+  - Progress notification (`N/Total · TC-ID`) during the run; final summary toast: `✓ Created X issues, Y failed, Z skipped (already linked)` with details for failed ones.
+  - Each newly created issue is linked back to its TC in the local link map.
+
+### Fixed
+- **TC parser** now stops at the first non-table line after the main test case table — previously it kept walking past blank lines and folded in rows from any later table that also had a `TC ID` column (e.g. an "NG Summary" cheat-sheet at the end of the file), which doubled the selection count.
+
+### Changed
+- Test Case Report table gained an extra column at the left for selection checkboxes — placeholder spacing keeps non-failable rows aligned.
+
 ## [1.4.2]
 
 ### Fixed

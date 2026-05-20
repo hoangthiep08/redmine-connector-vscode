@@ -3,7 +3,7 @@
   "displayName": "Redmine Connector",
   "description": "Connect your company's Redmine to VS Code, Cursor, Windsurf — manage issues and push to AI chat",
   "publisher": "hoangthiep",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "engines": {
     "vscode": "^1.90.0"
   },

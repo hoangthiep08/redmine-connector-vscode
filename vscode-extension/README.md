@@ -124,6 +124,13 @@ Use the **$(feedback) Send Feedback** button in the sidebar toolbar to report bu
 
 ## Release Notes
 
+### 1.5.0
+- **🚀 Bulk-create issues from test cases** — checkbox column on the Test Case Report, sticky bulk bar with always-visible **Select all** / **Unselect all** buttons, and **`✚ Create N Issues`** that activates once you tick at least one row.
+  - Click **`✚ Create N Issues`** → opens the Create Issue form in bulk mode (banner explains the flow). Subject / Description / Custom Fields preview the first TC; **Project / Tracker / Status / Priority / Assignee / Due Date** are the shared settings.
+  - Submit → confirm modal (the form stays open while you confirm — cancelling keeps you on the form) → progress notification → final summary (created / failed / skipped). Each issue's per-TC fields are **re-interpolated from the template** (subject, description, custom fields, evidence attachments).
+  - **CF fallback**: any required custom field that's empty for a given TC (e.g. "Type Bug" on a TC without that column) is filled with the value picked in the bulk form, so the issue still creates successfully.
+  - Already-linked TCs are skipped automatically. TC parser now stops at the first non-table line — fixes a bug where a second `TC ID` table later in the file (e.g. an "NG Summary") doubled the selection count.
+
 ### 1.4.2
 - **Fixed**: test case header detection now covers every column in the markdown table — `Page/Screen`, `PC`, `SP`, `Q&A`, `Status 2 (QC)`, `Date 2`, `ID Bug`, `Browser/Device`, and any custom header now show up as draggable chips in the template builder.
 - Template interpolation accepts both raw header names (`{{TC ID}}`, `{{Page/Screen}}`) and legacy camelCase keys (`{{tcId}}`, `{{module}}`). Existing templates keep working.

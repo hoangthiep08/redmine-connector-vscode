@@ -14,9 +14,44 @@ import {
 } from "./redmine-client";
 import type { CustomFieldConfigEntry } from "./settings-webview";
 
+export interface BulkCreateConfig {
+  /** How many issues will be created when the form is submitted. */
+  count: number;
+  /**
+   * Called when the user submits the form in bulk mode.
+   * Return `true` to indicate the bulk creation ran (so the form can close),
+   * or `false` to keep the form open (e.g. user cancelled the confirm modal).
+   */
+  onBulkSubmit: (formValues: BulkFormValues) => Promise<boolean>;
+}
+
+export interface BulkFormValues {
+  projectId: string;
+  projectName: string;
+  trackerId: number;
+  trackerName: string;
+  statusId: number;
+  statusName: string;
+  priorityId: number;
+  priorityName: string;
+  assignedToId: number;
+  assigneeName: string;
+  dueDate: string;
+  startDate: string;
+  /**
+   * CF values the user picked in the form — used as a fallback for any
+   * template-driven CF that interpolates to empty for a given test case.
+   * Solves the "required CF without per-TC data" case (e.g. Type Bug).
+   */
+  customFieldsFallback: { id: number; name: string; value: string }[];
+  // Note: subject/description are NOT here — they're recomputed per test case
+  // from the template by the bulk caller.
+}
+
 export class CreateIssueWebview {
   private panel: vscode.WebviewPanel | null = null;
   private onCreated: ((issueId: number, subject: string) => void) | null = null;
+  private bulk: BulkCreateConfig | null = null;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -36,13 +71,14 @@ export class CreateIssueWebview {
       preAttachments?: { data: string; filename: string; contentType: string }[];
     },
     onCreated?: (issueId: number, subject: string) => void,
+    bulk?: BulkCreateConfig,
   ) {
     const standalone = !prefill;
     if (this.panel) {
       // Reveal only when the existing panel matches the request (both standalone).
       // Otherwise the cached panel still holds the previous template's prefill /
       // CF restriction — dispose and rebuild fresh.
-      if (standalone && !this.openedFromTemplate) {
+      if (standalone && !this.openedFromTemplate && !bulk) {
         this.panel.reveal();
         return;
       }
@@ -51,6 +87,7 @@ export class CreateIssueWebview {
     }
     this.onCreated = onCreated ?? null;
     this.openedFromTemplate = !standalone;
+    this.bulk = bulk ?? null;
 
     // When opened from a template, restrict the custom field UI to the names the
     // template explicitly selected. Standalone "+ New Issue" passes nothing → show all.
@@ -86,7 +123,7 @@ export class CreateIssueWebview {
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    this.panel.onDidDispose(() => { this.panel = null; this.onCreated = null; });
+    this.panel.onDidDispose(() => { this.panel = null; this.onCreated = null; this.bulk = null; });
 
     const logoUri = this.panel.webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, "resources", "redmine.png")
@@ -97,6 +134,7 @@ export class CreateIssueWebview {
       projects, trackers, statuses, priorities, members,
       logoUri.toString(),
       prefill,
+      this.bulk ? { count: this.bulk.count } : undefined,
     );
 
     this.panel.webview.onDidReceiveMessage(async (msg) => {
@@ -125,6 +163,49 @@ export class CreateIssueWebview {
             : trackerCfg.fields;
           this.panel?.webview.postMessage({ command: "fieldsResult", fields, status: fields.length === 0 ? "none" : "ok" });
         }
+      }
+
+      // Bulk mode: caller (TestCaseWebview) owns the create loop. We forward
+      // the user's common-field choices and let them iterate over the TCs.
+      if (msg.command === "createBulk") {
+        if (!this.bulk) return;
+        const rawCf: unknown[] = Array.isArray(msg.customFieldsFallback) ? msg.customFieldsFallback : [];
+        const customFieldsFallback: { id: number; name: string; value: string }[] = [];
+        for (const item of rawCf) {
+          if (typeof item !== "object" || item === null) continue;
+          const obj = item as Record<string, unknown>;
+          if (!("id" in obj)) continue;
+          customFieldsFallback.push({
+            id:    Number(obj.id),
+            name:  String(obj.name ?? ""),
+            value: String(obj.value ?? ""),
+          });
+        }
+        const formValues: BulkFormValues = {
+          projectId:    String(msg.projectId ?? ""),
+          projectName:  String(msg.projectName ?? ""),
+          trackerId:    Number(msg.trackerId ?? 0),
+          trackerName:  String(msg.trackerName ?? ""),
+          statusId:     Number(msg.statusId ?? 0),
+          statusName:   String(msg.statusName ?? ""),
+          priorityId:   Number(msg.priorityId ?? 0),
+          priorityName: String(msg.priorityName ?? ""),
+          assignedToId: Number(msg.assignedToId ?? 0),
+          assigneeName: String(msg.assigneeName ?? ""),
+          dueDate:      String(msg.dueDate ?? ""),
+          startDate:    String(msg.startDate ?? ""),
+          customFieldsFallback,
+        };
+        // Keep the form visible while the caller shows its confirm modal — if
+        // the user cancels we want them back in the form, not on the test-case
+        // page. Only dispose once onBulkSubmit reports it actually ran.
+        try {
+          const ran = await this.bulk.onBulkSubmit(formValues);
+          if (ran) this.panel?.dispose();
+        } catch (err) {
+          vscode.window.showErrorMessage(`Bulk create failed: ${String(err)}`);
+        }
+        return;
       }
 
       if (msg.command === "create") {
@@ -195,6 +276,7 @@ function buildHtml(
     customFieldValues?: Record<string, string>;
     preAttachments?: { data: string; filename: string; contentType: string }[];
   },
+  bulk?: { count: number },
 ): string {
   const defaultPriority = priorities.find((p) => p.is_default);
   const openStatuses    = statuses.filter((s) => !s.is_closed);
@@ -359,12 +441,18 @@ function buildHtml(
 <div class="page-header">
   <img src="${e(logoSrc)}" alt="Redmine">
   <div>
-    <div class="title">Create New Issue</div>
-    <div class="sub">Fill in the details below — fields marked <span style="color:var(--vscode-errorForeground)">*</span> are required</div>
+    <div class="title">${bulk && bulk.count > 0 ? `Create ${bulk.count} Issues (Bulk)` : "Create New Issue"}</div>
+    <div class="sub">${bulk && bulk.count > 0
+      ? `Configure the shared fields below — <strong>Subject</strong>, <strong>Description</strong>, and <strong>Custom Fields</strong> are filled per test case from the template.`
+      : `Fill in the details below — fields marked <span style="color:var(--vscode-errorForeground)">*</span> are required`}</div>
   </div>
 </div>
 
 <div class="body">
+${bulk && bulk.count > 0 ? `
+<div style="margin-bottom:14px;padding:10px 14px;border-radius:6px;background:color-mix(in srgb,var(--vscode-charts-blue) 12%,transparent);border-left:3px solid var(--vscode-charts-blue);font-size:.85em">
+  <strong>Bulk mode:</strong> ${bulk.count} issue${bulk.count > 1 ? "s" : ""} will be created from the selected test cases. The Subject / Description / Custom Field inputs below show a <em>preview</em> using the first TC, but each issue gets its own values from the template.
+</div>` : ""}
 
   <!-- ── Basic ── -->
   <div class="sec-title">Basic Information</div>
@@ -463,7 +551,7 @@ function buildHtml(
   </div>
 
   <div class="btn-row">
-    <button class="btn" id="submitBtn" onclick="submit()">✚ Create Issue</button>
+    <button class="btn" id="submitBtn" onclick="submit()">${bulk && bulk.count > 0 ? `✚ Create ${bulk.count} Issues` : "✚ Create Issue"}</button>
     <button class="btn btn-sec" onclick="resetForm()">↺ Reset</button>
   </div>
 
@@ -487,6 +575,7 @@ function buildHtml(
 
 <script>
   const vscode = acquireVsCodeApi();
+  const BULK_COUNT    = ${JSON.stringify(bulk?.count ?? 0)};
   const PREFILL_CF    = ${JSON.stringify(prefill?.customFieldValues ?? {})};
   const PREFILL_FILES = ${JSON.stringify(
     (prefill?.preAttachments ?? []).map((f, i) => ({
@@ -555,7 +644,8 @@ function buildHtml(
     document.querySelectorAll('[data-cf-id]').forEach(function(el) {
       const id = Number(el.getAttribute('data-cf-id'));
       if (!id) return;
-      result.push({ id, value: el.value });
+      const name = el.getAttribute('data-cf-name') || '';
+      result.push({ id, name, value: el.value });
     });
     return result;
   }
@@ -646,12 +736,42 @@ function buildHtml(
     }
 
     const btn = document.getElementById('submitBtn');
-    btn.disabled = true; btn.textContent = 'Creating…';
+    btn.disabled = true; btn.textContent = BULK_COUNT > 0 ? 'Creating ' + BULK_COUNT + '…' : 'Creating…';
 
     const files        = pendingFiles.map(f => ({ data: f.data, filename: f.filename, contentType: f.contentType }));
     const customFields = collectCustomFields();
 
-    vscode.postMessage({ command: 'create', projectId, trackerId, subject, description, statusId, priorityId, assignedToId, dueDate, files, customFields });
+    if (BULK_COUNT > 0) {
+      // Bulk mode: forward common form values + the CF values picked in the
+      // form as a fallback for TCs whose template interpolation comes back
+      // empty (covers required CFs without per-TC data, e.g. "Type Bug").
+      // Also send the display NAMES of each selected option so the bulk
+      // confirm modal can show "Bug" instead of "Tracker ID: 1".
+      const selText = function(id) {
+        const o = document.getElementById(id);
+        if (!o) return '';
+        const opt = o.options[o.selectedIndex];
+        return opt ? (opt.text || '') : '';
+      };
+      const projectName  = selText('project');
+      const trackerName  = selText('tracker');
+      const statusName   = selText('status');
+      const priorityName = selText('priority');
+      const assigneeName = selText('assignee');
+      const customFieldsFallback = collectCustomFields();
+      vscode.postMessage({
+        command: 'createBulk',
+        projectId, projectName,
+        trackerId, trackerName,
+        statusId, statusName,
+        priorityId, priorityName,
+        assignedToId, assigneeName,
+        dueDate,
+        customFieldsFallback,
+      });
+    } else {
+      vscode.postMessage({ command: 'create', projectId, trackerId, subject, description, statusId, priorityId, assignedToId, dueDate, files, customFields });
+    }
   }
 
   function resetForm() {

@@ -2,7 +2,8 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { CreateIssueWebview } from "./create-issue-webview";
+import { CreateIssueWebview, type BulkFormValues } from "./create-issue-webview";
+import { createIssue, uploadAttachment } from "./redmine-client";
 import type { CustomFieldConfigEntry } from "./settings-webview";
 import type { TrackerFieldCacheEntry } from "./extension";
 
@@ -74,7 +75,10 @@ function parseMarkdownTable(content: string): TC[] {
 
   for (let i = headerIdx + 2; i < lines.length; i++) {
     const line = lines[i];
-    if (!line.trim().startsWith("|")) continue;
+    // STOP at first non-table line — otherwise we'd accidentally fold in rows
+    // from any later markdown table that also has a "TC ID" column (e.g. a
+    // separate "NG Summary" at the end of the file, which duplicates rows).
+    if (!line.trim().startsWith("|")) break;
 
     const cells = line.split("|").slice(1, -1);
     if (cells.length < 3) continue;
@@ -523,6 +527,58 @@ export class TestCaseWebview {
         );
       }
 
+      // ── Bulk-create issues from multiple selected test cases ──────────
+      if (msg.command === "createIssuesBulk") {
+        const tcIds = (msg.tcIds as string[]) ?? [];
+        const filePath = this.currentFilePath;
+        if (!filePath || tcIds.length === 0) return;
+
+        // Resolve TC objects from the user's selection. We index `currentTcs`
+        // by tcId (first occurrence wins) and look each selected id up in that
+        // index. This guarantees the count matches exactly what the user
+        // checked even if `currentTcs` somehow contained duplicates.
+        const tcById = new Map<string, TC>();
+        for (const t of this.currentTcs) {
+          if (!tcById.has(t.tcId)) tcById.set(t.tcId, t);
+        }
+        const linkMap = this.getLinkMap();
+        const candidateTcs: TC[] = [];
+        let skippedAlreadyLinked = 0;
+        for (const id of tcIds) {
+          const tc = tcById.get(id);
+          if (!tc) continue; // selection refers to a TC no longer in the file
+          if (linkMap[mapKey(filePath, id)]) { skippedAlreadyLinked++; continue; }
+          candidateTcs.push(tc);
+        }
+
+        if (candidateTcs.length === 0) {
+          vscode.window.showWarningMessage("All selected test cases already have issues linked. Nothing to create.");
+          return;
+        }
+
+        const cfg = vscode.workspace.getConfiguration("redmine");
+        const template = cfg.get<Record<string, unknown>>("testCaseTemplate") ?? {};
+        const customFieldConfig = this.context.globalState.get<CustomFieldConfigEntry[]>("customFieldConfig") ?? [];
+
+        // Preview-prefill the create-issue webview using the first candidate TC
+        // so the user sees realistic Subject/Description/CF values.
+        const firstTc = candidateTcs[0];
+        const previewPrefill = this.buildPerTcPrefill(firstTc, template, customFieldConfig, filePath);
+
+        await this.createIssueWebview.show(
+          previewPrefill,
+          undefined,
+          {
+            count: candidateTcs.length,
+            onBulkSubmit: async (formValues: BulkFormValues) => {
+              return this.runBulkCreate(
+                candidateTcs, formValues, template, customFieldConfig, filePath, skippedAlreadyLinked,
+              );
+            },
+          },
+        );
+      }
+
       if (msg.command === "openIssue") {
         vscode.commands.executeCommand("redmine.openIssue", { issue: { id: msg.issueId as number } });
       }
@@ -535,6 +591,248 @@ export class TestCaseWebview {
         this.rerender();
       }
     });
+  }
+
+  /**
+   * Build the create-issue prefill payload (subject, description, custom-field
+   * values, evidence attachments, …) for a single TC by running the template
+   * through interpolation. Shared between single-create and the bulk preview.
+   */
+  private buildPerTcPrefill(
+    tc: TC,
+    template: Record<string, unknown>,
+    customFieldConfig: CustomFieldConfigEntry[],
+    filePath: string,
+  ): {
+    subject: string;
+    description: string;
+    trackerName?: string;
+    statusName?: string;
+    customFieldValues?: Record<string, string>;
+    customFieldNames?: string[];
+    preAttachments?: { data: string; filename: string; contentType: string }[];
+  } {
+    const mdDir = path.dirname(filePath);
+    const preAttachments = tc.evidence ? parseEvidenceAttachments(tc.evidence, mdDir) : [];
+
+    let subject = `[${tc.tcId}] ${tc.scenario}`;
+    let description = formatDescription(tc);
+    let trackerName = "Bug";
+    let statusName = "New";
+    const customFieldValues: Record<string, string> = {};
+    let templateCfNames: string[] = [];
+
+    if (Object.keys(template).length > 0) {
+      if (template.subject) subject = interpolateTemplate(String(template.subject), tc);
+      if (template.description) description = interpolateTemplate(String(template.description), tc);
+      if (template.tracker) trackerName = String(template.tracker);
+      if (template.status) statusName = String(template.status);
+
+      const templateCf = ((template.customFields as Record<string, string> | undefined) ?? {});
+      templateCfNames = Object.keys(templateCf);
+      const trackerId = template.trackerId ? Number(template.trackerId) : 0;
+      const trackerCfg = customFieldConfig.find((c) => c.trackerId === trackerId);
+
+      for (const [fieldName, fieldTpl] of Object.entries(templateCf)) {
+        if (!fieldTpl) continue;
+        const interpolated = interpolateTemplate(fieldTpl, tc).trim();
+        if (!interpolated) continue;
+        const fieldDef = trackerCfg?.fields.find((f) => f.name === fieldName);
+        if (fieldDef?.type === "select") {
+          const canonical = fieldDef.options.find((o) => o.trim().toLowerCase() === interpolated.toLowerCase());
+          if (canonical) customFieldValues[fieldName] = canonical;
+        } else {
+          customFieldValues[fieldName] = interpolated;
+        }
+      }
+    }
+
+    return {
+      subject,
+      description,
+      trackerName,
+      statusName,
+      customFieldValues: Object.keys(customFieldValues).length ? customFieldValues : undefined,
+      customFieldNames: templateCfNames.length ? templateCfNames : undefined,
+      preAttachments: preAttachments.length ? preAttachments : undefined,
+    };
+  }
+
+  /**
+   * Show a confirm modal listing the common settings, then loop over the given
+   * TCs creating one Redmine issue per TC. Each issue's subject / description /
+   * custom fields / attachments are re-interpolated from the template per-TC;
+   * project, tracker, status, priority, assignee, and dueDate come from the
+   * user's choices in the create-issue form.
+   */
+  private async runBulkCreate(
+    tcs: TC[],
+    common: BulkFormValues,
+    template: Record<string, unknown>,
+    customFieldConfig: CustomFieldConfigEntry[],
+    filePath: string,
+    skippedAlreadyLinked: number,
+  ): Promise<boolean> {
+    const summaryLines: string[] = [
+      `Project:  ${common.projectName  || common.projectId || "(none)"}`,
+      `Tracker:  ${common.trackerName  || (common.trackerId ? `#${common.trackerId}` : "(template)")}`,
+      `Status:   ${common.statusName   || (common.statusId  ? `#${common.statusId}`  : "(template)")}`,
+      `Priority: ${common.priorityName || (common.priorityId ? `#${common.priorityId}` : "(default)")}`,
+      `Assignee: ${common.assigneeName || (common.assignedToId ? `#${common.assignedToId}` : "(unassigned)")}`,
+      common.dueDate ? `Due Date: ${common.dueDate}` : "Due Date: —",
+    ];
+    // Append the custom fields the user picked in the bulk form (Found in,
+    // Type Bug, etc.). Only show ones with a non-empty value.
+    const cfPicked = (common.customFieldsFallback ?? []).filter((cf) => (cf.value ?? "").trim() !== "");
+    if (cfPicked.length > 0) {
+      summaryLines.push("");
+      summaryLines.push("Custom fields (default for empty cells):");
+      for (const cf of cfPicked) {
+        summaryLines.push(`  • ${cf.name || `#${cf.id}`}: ${cf.value}`);
+      }
+    }
+    const summary = summaryLines.join("\n");
+    const confirm = await vscode.window.showWarningMessage(
+      `Create ${tcs.length} issue${tcs.length > 1 ? "s" : ""} from selected test cases?`,
+      {
+        modal: true,
+        // `detail` is the multi-line secondary block in the native modal — on
+        // macOS especially, newlines inside `message` get collapsed into the
+        // title, so the CF list / project name etc. weren't visible.
+        detail: `${summary}\n\nSubject / Description / Custom Fields are filled per test case from the template.`,
+      },
+      "Create All",
+    );
+    if (confirm !== "Create All") return false;
+
+    let success = 0;
+    let failed = 0;
+    const failures: Array<{ tcId: string; reason: string }> = [];
+    const trackerCfg = customFieldConfig.find((c) => c.trackerId === common.trackerId);
+    const templateCf = ((template.customFields as Record<string, string> | undefined) ?? {});
+    // Index the form's CF picks by name AND id for quick fallback lookup.
+    const fallbackByName = new Map<string, { id: number; value: string }>();
+    const fallbackById = new Map<number, { name: string; value: string }>();
+    for (const cf of common.customFieldsFallback ?? []) {
+      const v = (cf.value ?? "").trim();
+      if (!v) continue;
+      if (cf.name) fallbackByName.set(cf.name.toLowerCase(), { id: cf.id, value: v });
+      fallbackById.set(cf.id, { name: cf.name, value: v });
+    }
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Creating ${tcs.length} issues…`,
+        cancellable: false,
+      },
+      async (progress) => {
+        for (let i = 0; i < tcs.length; i++) {
+          const tc = tcs[i];
+          progress.report({
+            increment: 100 / tcs.length,
+            message: `${i + 1}/${tcs.length} · ${tc.tcId}`,
+          });
+          try {
+            // Per-TC interpolation
+            let subject = `[${tc.tcId}] ${tc.scenario}`;
+            let description = formatDescription(tc);
+            if (template.subject) subject = interpolateTemplate(String(template.subject), tc);
+            if (template.description) description = interpolateTemplate(String(template.description), tc);
+
+            // Custom fields — translate template values to {id, value} pairs.
+            // When per-TC interpolation comes back empty, fall back to whatever
+            // the user picked in the bulk form (covers required CFs like
+            // "Type Bug" that aren't always present in the test case data).
+            const customFieldsPayload: { id: number; value: string }[] = [];
+            const coveredCfIds = new Set<number>();
+            for (const [fieldName, fieldTpl] of Object.entries(templateCf)) {
+              const fieldDef = trackerCfg?.fields.find((f) => f.name === fieldName);
+              if (!fieldDef) continue;
+              const interpolated = fieldTpl ? interpolateTemplate(fieldTpl, tc).trim() : "";
+              let value = "";
+              if (interpolated) {
+                if (fieldDef.type === "select") {
+                  const canonical = fieldDef.options.find((o) => o.trim().toLowerCase() === interpolated.toLowerCase());
+                  if (canonical) value = canonical;
+                } else {
+                  value = interpolated;
+                }
+              }
+              // Fallback to the form's value if interpolation came up empty.
+              if (!value) {
+                const fb = fallbackByName.get(fieldName.toLowerCase()) ?? fallbackById.get(fieldDef.id);
+                if (fb && fb.value) value = fb.value;
+              }
+              if (!value) continue;
+              customFieldsPayload.push({ id: fieldDef.id, value });
+              coveredCfIds.add(fieldDef.id);
+            }
+            // Pick up any CFs the user filled in the form that aren't in the
+            // template (rare — usually required fields outside the template).
+            for (const cf of common.customFieldsFallback ?? []) {
+              if (coveredCfIds.has(cf.id)) continue;
+              const v = (cf.value ?? "").trim();
+              if (!v) continue;
+              customFieldsPayload.push({ id: cf.id, value: v });
+              coveredCfIds.add(cf.id);
+            }
+
+            // Upload evidence attachments (per-TC).
+            const mdDir = path.dirname(filePath);
+            const preAttachments = tc.evidence ? parseEvidenceAttachments(tc.evidence, mdDir) : [];
+            const uploads = preAttachments.length
+              ? await Promise.all(preAttachments.map(async (f) => ({
+                  token:        await uploadAttachment(f.data, f.filename, f.contentType),
+                  filename:     f.filename,
+                  content_type: f.contentType,
+                })))
+              : undefined;
+
+            const issue = await createIssue({
+              projectId:    common.projectId,
+              subject,
+              description:  description || undefined,
+              trackerId:    common.trackerId || undefined,
+              statusId:     common.statusId || undefined,
+              priorityId:   common.priorityId || undefined,
+              assignedToId: common.assignedToId || undefined,
+              dueDate:      common.dueDate || undefined,
+              uploads,
+              customFields: customFieldsPayload.length ? customFieldsPayload : undefined,
+            });
+
+            // Link the newly created issue back to its TC
+            const map = this.getLinkMap();
+            map[mapKey(filePath, tc.tcId)] = {
+              issueId:   issue.id,
+              subject:   issue.subject,
+              line:      tc.line,
+              createdAt: new Date().toISOString(),
+            };
+            await this.context.globalState.update(STORAGE_KEY, map);
+            success++;
+          } catch (err) {
+            failed++;
+            failures.push({ tcId: tc.tcId, reason: String(err) });
+          }
+        }
+      },
+    );
+
+    this.rerender();
+
+    const parts = [`✓ Created ${success} issue${success !== 1 ? "s" : ""}`];
+    if (failed > 0) parts.push(`${failed} failed`);
+    if (skippedAlreadyLinked > 0) parts.push(`${skippedAlreadyLinked} skipped (already linked)`);
+    const message = parts.join(", ");
+    if (failed > 0) {
+      const detail = failures.slice(0, 5).map((f) => `• ${f.tcId}: ${f.reason}`).join("\n");
+      vscode.window.showWarningMessage(`${message}\n\n${detail}${failures.length > 5 ? "\n…" : ""}`, { modal: false });
+    } else {
+      vscode.window.showInformationMessage(message);
+    }
+    return true;
   }
 }
 
@@ -708,6 +1006,23 @@ function buildHtml(fileName: string, filePath: string, tcs: TC[], linkMap: Issue
     opacity: .4; cursor: not-allowed;
   }
 
+  /* Bulk select checkbox — only meaningful on failable + unlinked rows */
+  .bulk-cb { width: 14px; height: 14px; cursor: pointer; accent-color: var(--vscode-button-background); }
+  .bulk-cb-placeholder { display: inline-block; width: 14px; height: 14px; }
+
+  /* Bulk action bar — sticky above the table header so it stays visible while
+     the user scrolls through a long test case list. */
+  .bulk-bar { position: sticky; top: 0; z-index: 60; display: flex; align-items: center; gap: 8px;
+    padding: 8px 24px; border-bottom: 1px solid var(--vscode-widget-border, #444);
+    background: var(--vscode-editor-background); }
+  .bulk-bar .count { font-weight: 700; font-size: .85em; color: var(--vscode-textLink-foreground); margin-right: 4px; }
+  .bulk-bar .spacer { flex: 1; }
+  .bulk-bar button { font-family: inherit; cursor: pointer; border-radius: 4px; padding: 5px 12px; border: none; font-size: .82em; }
+  .bulk-btn-sec { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  .bulk-btn-primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-weight: 600; }
+  .bulk-btn-primary[disabled] { opacity: .4; cursor: not-allowed; }
+  .bulk-btn-sec:hover, .bulk-btn-primary:not([disabled]):hover { opacity: .87; }
+
   .issue-link {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 3px 9px; border-radius: 4px;
@@ -868,10 +1183,22 @@ function buildHtml(fileName: string, filePath: string, tcs: TC[], linkMap: Issue
 
 ${!hasTemplate ? `<div class="warning-banner">⚠️ <strong>No template configured.</strong> Click the "<strong>➕ Create Template</strong>" button above to define how columns map to issue fields.</div>` : ""}
 
+<!-- Sticky bulk action bar — sits above the table; Select all / Unselect all
+     are always visible, the selection-dependent bits show only when ≥1 row is
+     checked. -->
+<div class="bulk-bar" id="bulkBar">
+  <button class="bulk-btn-sec" onclick="bulkSelectAll()">Select all</button>
+  <button class="bulk-btn-sec" onclick="bulkUnselectAll()">Unselect all</button>
+  <button class="bulk-btn-primary" id="bulkCreateBtn" onclick="bulkCreate()" disabled>✚ Create Issues</button>
+  <span class="count" id="bulkCount" style="display:none">0 selected</span>
+  <span class="spacer"></span>
+</div>
+
 <div class="table-wrap">
 <table>
   <thead>
     <tr>
+      <th style="width:1%"><input type="checkbox" id="bulkHeaderCb" onchange="onBulkHeaderToggle(this)" title="Toggle all"></th>
       <th style="width:1%">Action</th>
       <th>TC ID</th>
       <th>Module</th>
@@ -934,9 +1261,19 @@ function render() {
     const sc = statusClass(tc.statusQc);
     const isFail = sc === 'fail';
     const rowClass = isFail ? 'fail-row' : '';
-    html += '<tr class="' + rowClass + '">';
-    html += '<td>';
     const linked = LINKS[tc.tcId];
+    html += '<tr class="' + rowClass + '">';
+    // Checkbox cell — only for failable + unlinked rows
+    html += '<td>';
+    if (isFail && !linked && HAS_TEMPLATE) {
+      const checked = _selectedTcIds.has(tc.tcId) ? ' checked' : '';
+      html += '<input type="checkbox" class="bulk-cb" data-tc-id="' + escHtml(tc.tcId) + '" onchange="onBulkCbChange(this)"' + checked + '>';
+    } else {
+      html += '<span class="bulk-cb-placeholder"></span>';
+    }
+    html += '</td>';
+    // Action cell
+    html += '<td>';
     if (linked) {
       html += '<a class="issue-link" onclick="openIssue(' + linked.issueId + ')" title="' + escHtml(linked.subject) + '">'
         + '#' + linked.issueId + '</a>'
@@ -958,6 +1295,72 @@ function render() {
 
 function createIssue(idx) {
   vscode.postMessage({ command: 'createIssue', tc: TCS[idx] });
+}
+
+// ── Bulk-create selection state ────────────────────────────────────────────
+const _selectedTcIds = new Set();
+
+function onBulkCbChange(cb) {
+  const id = cb.dataset.tcId;
+  if (cb.checked) _selectedTcIds.add(id); else _selectedTcIds.delete(id);
+  updateBulkBar();
+  syncHeaderCb();
+}
+
+function bulkSelectAll() {
+  document.querySelectorAll('input.bulk-cb').forEach(function(cb) {
+    cb.checked = true;
+    _selectedTcIds.add(cb.dataset.tcId);
+  });
+  updateBulkBar();
+  syncHeaderCb();
+}
+
+function bulkUnselectAll() {
+  document.querySelectorAll('input.bulk-cb').forEach(function(cb) { cb.checked = false; });
+  _selectedTcIds.clear();
+  updateBulkBar();
+  syncHeaderCb();
+}
+
+function onBulkHeaderToggle(cb) {
+  if (cb.checked) bulkSelectAll(); else bulkUnselectAll();
+}
+
+function syncHeaderCb() {
+  const h = document.getElementById('bulkHeaderCb');
+  if (!h) return;
+  const all = document.querySelectorAll('input.bulk-cb');
+  if (!all.length) { h.checked = false; h.indeterminate = false; return; }
+  const checked = document.querySelectorAll('input.bulk-cb:checked').length;
+  h.checked = checked > 0 && checked === all.length;
+  h.indeterminate = checked > 0 && checked < all.length;
+}
+
+function updateBulkBar() {
+  const n = _selectedTcIds.size;
+  const btn = document.getElementById('bulkCreateBtn');
+  const cnt = document.getElementById('bulkCount');
+  if (n === 0) {
+    btn.disabled = true;
+    btn.textContent = '✚ Create Issues';
+    cnt.style.display = 'none';
+  } else {
+    btn.disabled = false;
+    btn.textContent = '✚ Create ' + n + ' Issue' + (n > 1 ? 's' : '');
+    cnt.style.display = '';
+    cnt.textContent = n + ' selected';
+  }
+}
+
+function bulkCreate() {
+  if (_selectedTcIds.size === 0) return;
+  if (!HAS_TEMPLATE) {
+    alert('No template configured. Click "➕ Create Template" first.');
+    return;
+  }
+  const tcIds = Array.from(_selectedTcIds);
+  vscode.postMessage({ command: 'createIssuesBulk', tcIds: tcIds });
 }
 
 function openIssue(issueId) {

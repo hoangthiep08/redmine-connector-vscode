@@ -117,6 +117,7 @@ export class IssueWebview {
         );
         break;
 
+
       case "updateProgress": {
         const ratio = msg.ratio as number;
         try { await updateIssue(this.currentIssue!.id, { doneRatio: ratio }); await this.refresh(); }
