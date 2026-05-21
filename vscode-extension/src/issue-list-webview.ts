@@ -7,6 +7,7 @@ import {
   listPriorities,
   listProjectMembers,
   getIssue,
+  updateIssue,
   fetchAttachmentAsDataUrl,
   type Issue,
 } from "./redmine-client";
@@ -217,6 +218,30 @@ export class IssueListWebview {
         }
       }
 
+      // ── Fetch members for the detail panel's assignee dropdown ────────
+      if (msg.command === "fetchDetailMembers") {
+        const projId = String(msg.projectId ?? "").trim();
+        const ms = projId
+          ? await listProjectMembers(projId).then((m) => m.map((x) => ({ id: String(x.id), name: x.name }))).catch(() => [])
+          : [];
+        this.panel?.webview.postMessage({ command: "detailMembersResult", members: ms });
+      }
+
+      // ── Update status/assignee from the inline detail panel ────────────
+      if (msg.command === "updateDetailIssue") {
+        const issueId = msg.issueId as number;
+        const updates: { statusId?: number; assignedToId?: number } = {};
+        if (msg.statusId !== undefined) updates.statusId = msg.statusId as number;
+        if (msg.assignedToId !== undefined) updates.assignedToId = msg.assignedToId as number;
+        try {
+          await updateIssue(issueId, updates);
+          const issue = await getIssue(issueId);
+          this.panel?.webview.postMessage({ command: "issueDetailResult", issue });
+        } catch (err) {
+          this.panel?.webview.postMessage({ command: "issueDetailUpdateError", message: String(err) });
+        }
+      }
+
       // ── Apply current filter to global settings ─────────────────────────
       if (msg.command === "applyToGlobal") {
         const f = msg.filter as FilterState;
@@ -383,6 +408,36 @@ function buildHtml(data: {
   .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 1000; align-items: center; justify-content: center; cursor: zoom-out; padding: 24px; }
   .lightbox.open { display: flex; }
   .lightbox img { max-width: 95%; max-height: 95%; object-fit: contain; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
+
+  /* Inline editable selects in the detail panel */
+  .detail-select {
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 2px 7px;
+    font-size: .78em;
+    font-family: inherit;
+    cursor: pointer;
+    outline: none;
+    max-width: 100%;
+  }
+  .detail-select:hover { border-color: var(--vscode-focusBorder); }
+  .detail-select:focus { border-color: var(--vscode-focusBorder); }
+  .detail-kv .detail-inline-select {
+    width: 100%;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border,#555);
+    border-radius: 3px;
+    padding: 3px 6px;
+    font-size: .82em;
+    font-family: inherit;
+    cursor: pointer;
+    outline: none;
+  }
+  .detail-kv .detail-inline-select:hover { border-color: var(--vscode-focusBorder); }
+  .detail-kv .detail-inline-select:focus { border-color: var(--vscode-focusBorder); }
 </style>
 </head>
 <body>
@@ -813,11 +868,13 @@ function buildHtml(data: {
     _selectedId = null;
   }
 
+  let _currentDetailIssue = null;
+
   function renderDetail(issue) {
     const el = document.getElementById('detailContent');
     const toolbar = document.getElementById('detailToolbar');
     if (!issue) { el.innerHTML = '<div class="detail-empty">Issue not available.</div>'; return; }
-    const assignee = issue.assigned_to ? issue.assigned_to.name : '—';
+    _currentDetailIssue = issue;
     const author = issue.author ? issue.author.name : '—';
     const created = formatDate(issue.created_on);
     const updated = formatDate(issue.updated_on);
@@ -842,19 +899,33 @@ function buildHtml(data: {
     html +=   '<h2>' + esc(issue.subject) + '</h2>';
     html += '</div>';
 
+    // Status select styled as a chip
+    const statusOpts = STATUSES.map(function(s) {
+      return '<option value="' + s.id + '"' + (String(issue.status.id) === s.id ? ' selected' : '') + '>' + esc(s.name) + '</option>';
+    }).join('');
     html += '<div class="detail-status-row">';
-    html +=   '<span class="detail-chip">' + esc(issue.status.name) + '</span>';
+    html +=   '<select class="detail-select" id="detailStatusSel" data-field="status" onchange="updateDetailField(this.dataset.field, this.value)">' + statusOpts + '</select>';
     html +=   '<span class="detail-chip">' + esc(issue.priority.name) + '</span>';
     html +=   '<span class="detail-chip">' + esc(issue.tracker.name) + '</span>';
     if (typeof issue.done_ratio === 'number') html += '<span class="detail-chip">' + issue.done_ratio + '%</span>';
     html += '</div>';
 
+    // Assignee select (populated after member fetch)
+    const currentAssigneeId = issue.assigned_to ? String(issue.assigned_to.id) : '0';
+    const currentAssigneeName = issue.assigned_to ? issue.assigned_to.name : '— Unassigned —';
     html += '<div class="detail-kv">';
-    html +=   '<div class="k">Assignee</div><div>' + esc(assignee) + '</div>';
+    html +=   '<div class="k">Assignee</div>';
+    html +=   '<div><select class="detail-inline-select" id="detailAssigneeSel" data-field="assignee" onchange="updateDetailField(this.dataset.field, this.value)">'
+            +   '<option value="0"' + (currentAssigneeId === '0' ? ' selected' : '') + '>— Unassigned —</option>'
+            +   (currentAssigneeId !== '0' ? '<option value="' + currentAssigneeId + '" selected>' + esc(currentAssigneeName) + '</option>' : '')
+            + '</select></div>';
     html +=   '<div class="k">Updated</div><div>' + esc(updated) + '</div>';
     html +=   '<div class="k">Start date</div><div>' + esc(start) + '</div>';
     html +=   '<div class="k">Due date</div><div>' + esc(due) + '</div>';
     html += '</div>';
+
+    // Fetch members for this project so assignee dropdown gets fully populated
+    vscode.postMessage({ command: 'fetchDetailMembers', projectId: issue.project.id });
 
     if (issue.custom_fields && issue.custom_fields.length) {
       html += '<div class="detail-section-title">Custom Fields</div>';
@@ -955,6 +1026,18 @@ function buildHtml(data: {
     });
   }
 
+  function updateDetailField(field, value) {
+    if (!_currentDetailIssue) return;
+    const msg = { command: 'updateDetailIssue', issueId: _currentDetailIssue.id };
+    if (field === 'status')   msg.statusId     = parseInt(value, 10);
+    if (field === 'assignee') msg.assignedToId = parseInt(value, 10);
+    // Disable the changed select while saving
+    const selId = field === 'status' ? 'detailStatusSel' : 'detailAssigneeSel';
+    const sel = document.getElementById(selId);
+    if (sel) sel.disabled = true;
+    vscode.postMessage(msg);
+  }
+
   function openLightbox(src) {
     const el = document.getElementById('lightbox');
     const im = document.getElementById('lightboxImg');
@@ -1035,6 +1118,22 @@ function buildHtml(data: {
         img.classList.remove('loading');
         img.alt = '⚠ Could not load image';
         img.style.opacity = '.4';
+      });
+    }
+    if (msg.command === 'detailMembersResult') {
+      const sel = document.getElementById('detailAssigneeSel');
+      if (!sel || !_currentDetailIssue) return;
+      const currentId = _currentDetailIssue.assigned_to ? String(_currentDetailIssue.assigned_to.id) : '0';
+      sel.innerHTML = '<option value="0"' + (currentId === '0' ? ' selected' : '') + '>— Unassigned —</option>'
+        + (msg.members || []).map(function(m) {
+            return '<option value="' + m.id + '"' + (m.id === currentId ? ' selected' : '') + '>' + esc(m.name) + '</option>';
+          }).join('');
+    }
+    if (msg.command === 'issueDetailUpdateError') {
+      // Re-enable any disabled selects
+      ['detailStatusSel', 'detailAssigneeSel'].forEach(function(id) {
+        const sel = document.getElementById(id);
+        if (sel) sel.disabled = false;
       });
     }
     if (msg.command === 'filterReset') {

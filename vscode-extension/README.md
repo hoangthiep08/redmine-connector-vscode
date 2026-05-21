@@ -124,6 +124,9 @@ Use the **$(feedback) Send Feedback** button in the sidebar toolbar to report bu
 
 ## Release Notes
 
+### 1.5.1
+- **Inline Status & Assignee editing in the Issue List detail panel** — the Status chip is now a dropdown; the Assignee row in the key-value grid is also a dropdown. Change either value directly in the panel without opening the full issue tab. The panel refreshes automatically after saving.
+
 ### 1.5.0
 - **🚀 Bulk-create issues from test cases** — checkbox column on the Test Case Report, sticky bulk bar with always-visible **Select all** / **Unselect all** buttons, and **`✚ Create N Issues`** that activates once you tick at least one row.
   - Click **`✚ Create N Issues`** → opens the Create Issue form in bulk mode (banner explains the flow). Subject / Description / Custom Fields preview the first TC; **Project / Tracker / Status / Priority / Assignee / Due Date** are the shared settings.

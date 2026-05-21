@@ -2,6 +2,11 @@
 
 All notable changes to the **Redmine Connector** extension are documented in this file.
 
+## [1.5.1]
+
+### Added
+- **Inline Status & Assignee editing in the Issue List detail panel** — click the Status dropdown (chip in the header row) or the Assignee dropdown (in the key-value grid) to change the value directly without opening the full issue tab. The panel refreshes automatically after saving.
+
 ## [1.5.0]
 
 ### Added
